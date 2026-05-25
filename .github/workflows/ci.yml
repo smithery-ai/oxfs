@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check + Clippy
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo check --workspace
+
+  test:
+    name: Tests
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  build-linux:
+    name: Build Linux (${{ matrix.target }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+      - name: Install FUSE dev headers
+        run: sudo apt-get update && sudo apt-get install -y libfuse-dev
+      - run: cargo build --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oxfs-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/oxfs
+
+  pjdfstest:
+    name: POSIX Compliance
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: [check]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build test container
+        run: docker build -f Dockerfile.test -t oxfs-test .
+      - name: Run pjdfstest
+        run: |
+          docker run --rm --privileged oxfs-test '
+            rm -rf /tmp/oxfs-mount /tmp/oxfs-data /tmp/oxfs.db
+            mkdir -p /tmp/oxfs-mount /tmp/oxfs-data
+            /app/target/release/oxfs mount /tmp/oxfs-mount \
+              --backend fs --root /tmp/oxfs-data \
+              --meta-db /tmp/oxfs.db --default-permissions 2>/dev/null &
+            sleep 2
+            cd /tmp/oxfs-mount
+            prove -r /opt/pjdfstest/tests/ 2>&1 | tail -5
+          '
