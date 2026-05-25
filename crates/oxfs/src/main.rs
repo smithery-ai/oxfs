@@ -48,6 +48,9 @@ enum Command {
         cache_disk_mb: u64,
         #[arg(long)]
         wal_path: Option<PathBuf>,
+        /// Fork into the background before mounting.
+        #[arg(short = 'd', long)]
+        daemonize: bool,
     },
 }
 
@@ -102,6 +105,7 @@ fn main() -> Result<()> {
             cache_disk_path,
             cache_disk_mb,
             wal_path,
+            daemonize,
         } => {
             let op = match backend.as_str() {
                 "fs" => {
@@ -137,6 +141,12 @@ fn main() -> Result<()> {
                     .map(|p| format!(", {}MB disk at {}", cache_disk_mb, p.display()))
                     .unwrap_or_default(),
             );
+
+            if daemonize {
+                let daemon = daemonize::Daemonize::new()
+                    .working_directory("/");
+                daemon.start()?;
+            }
 
             match meta_backend.as_str() {
                 "redb" => {
