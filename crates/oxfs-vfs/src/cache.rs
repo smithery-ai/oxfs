@@ -14,6 +14,7 @@ pub trait CacheLayer: Send + Sync {
     async fn write_slice(&self, slice_id: u64, data: Bytes) -> DataResult<()>;
     async fn delete_slice(&self, slice_id: u64) -> DataResult<()>;
     async fn flush_dirty(&self) -> DataResult<()>;
+    fn dirty_count(&self) -> usize;
 }
 
 pub struct PassthroughCache<D: DataEngine> {
@@ -43,6 +44,8 @@ impl<T: DataEngine> CacheLayer for PassthroughCache<T> {
     async fn flush_dirty(&self) -> DataResult<()> {
         Ok(())
     }
+
+    fn dirty_count(&self) -> usize { 0 }
 }
 
 pub struct CacheConfig {
@@ -147,20 +150,17 @@ impl<D: DataEngine> TieredCache<D> {
 #[async_trait]
 impl<D: DataEngine> CacheLayer for TieredCache<D> {
     async fn read_slice(&self, slice_id: u64) -> DataResult<Bytes> {
-        // L1 check (includes dirty slices not yet flushed)
         if let Some(data) = self.l1.get(&slice_id).await {
             self.l1_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(data);
         }
 
-        // L2 check
         if let Some(data) = self.disk_read(slice_id).await {
             self.l2_hits.fetch_add(1, Ordering::Relaxed);
             self.l1.insert(slice_id, data.clone()).await;
             return Ok(data);
         }
 
-        // Miss: fetch from backend
         self.misses.fetch_add(1, Ordering::Relaxed);
         let data = self.inner.read_slice(slice_id).await?;
         self.l1.insert(slice_id, data.clone()).await;
@@ -169,10 +169,8 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
     }
 
     async fn write_slice(&self, slice_id: u64, data: Bytes) -> DataResult<()> {
-        // Optimistic: write to L1 only, mark dirty
         self.l1.insert(slice_id, data.clone()).await;
         self.dirty.lock().insert(slice_id);
-        tracing::trace!(slice_id, bytes = data.len(), "write_slice (buffered)");
         Ok(())
     }
 
@@ -180,7 +178,6 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
         self.dirty.lock().remove(&slice_id);
         self.l1.invalidate(&slice_id).await;
         self.disk_delete(slice_id).await;
-        // Best-effort delete from backend (may not exist if never flushed)
         let _ = self.inner.delete_slice(slice_id).await;
         Ok(())
     }
@@ -188,34 +185,59 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
     async fn flush_dirty(&self) -> DataResult<()> {
         let to_flush: Vec<u64> = {
             let mut dirty = self.dirty.lock();
-            let ids: Vec<u64> = dirty.drain().collect();
-            ids
+            dirty.drain().collect()
         };
 
         if to_flush.is_empty() {
             return Ok(());
         }
 
-        tracing::debug!(count = to_flush.len(), "flushing dirty slices to backend");
+        tracing::debug!(count = to_flush.len(), "flushing dirty slices (parallel)");
 
-        let mut errors = Vec::new();
-        for slice_id in &to_flush {
-            if let Some(data) = self.l1.get(slice_id).await {
-                if let Err(e) = self.inner.write_slice(*slice_id, data.clone()).await {
-                    // Re-mark as dirty on failure
-                    self.dirty.lock().insert(*slice_id);
-                    errors.push(e);
-                } else {
-                    // Write-through to disk cache on flush
-                    self.disk_write(*slice_id, &data).await;
+        // Collect all (slice_id, data) pairs first
+        let mut items = Vec::with_capacity(to_flush.len());
+        for sid in &to_flush {
+            if let Some(data) = self.l1.get(sid).await {
+                items.push((*sid, data));
+            }
+        }
+
+        // Flush all in parallel
+        let futs: Vec<_> = items.iter().map(|(sid, data)| {
+            let sid = *sid;
+            let data = data.clone();
+            async move {
+                (sid, self.inner.write_slice(sid, data).await)
+            }
+        }).collect();
+
+        let results = futures::future::join_all(futs).await;
+
+        let mut first_error = None;
+        for (sid, result) in results {
+            match result {
+                Ok(()) => {
+                    if let Some(data) = self.l1.get(&sid).await {
+                        self.disk_write(sid, &data).await;
+                    }
+                }
+                Err(e) => {
+                    self.dirty.lock().insert(sid);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
                 }
             }
         }
 
-        if let Some(e) = errors.into_iter().next() {
+        if let Some(e) = first_error {
             return Err(e);
         }
 
         Ok(())
+    }
+
+    fn dirty_count(&self) -> usize {
+        self.dirty.lock().len()
     }
 }

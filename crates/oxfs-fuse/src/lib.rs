@@ -439,7 +439,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
         reply: ReplyEmpty,
     ) {
         // Compact slices on file close
-        let _ = self.rt.block_on(self.vfs.compact_slices(ino.into()));
+        let _ = self.rt.block_on(self.vfs.compact_and_flush(ino.into()));
         reply.ok();
     }
 
@@ -465,7 +465,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let _ = self.rt.block_on(self.vfs.compact_slices(ino.into()));
+        let _ = self.rt.block_on(self.vfs.compact_and_flush(ino.into()));
         reply.ok();
     }
 

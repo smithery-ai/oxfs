@@ -228,8 +228,8 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
         Ok(())
     }
 
-    pub async fn compact_slices(&self, inode: u64) -> VfsResult<()> {
-        self.cache.flush_dirty().await.map_err(|e| VfsError::Data(e))?;
+    pub async fn compact_and_flush(&self, inode: u64) -> VfsResult<()> {
+        // Step 1: compact all chunks for this inode (merge N slices -> 1 per chunk, in L1 only)
         let chunks = self.meta.get_chunks_for_inode(inode).await?;
 
         for (chunk_idx, slices) in chunks {
@@ -251,6 +251,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
             }
 
             let merged_id = self.meta.next_slice_id().await?;
+            // write_slice goes to L1 + dirty set (won't hit network yet)
             self.cache
                 .write_slice(merged_id, Bytes::from(buf))
                 .await?;
@@ -264,11 +265,14 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
                 .replace_slices(inode, chunk_idx, vec![merged])
                 .await?;
 
+            // Remove old slices from dirty set so they don't get flushed
             for s in &slices {
                 let _ = self.cache.delete_slice(s.id).await;
             }
         }
 
+        // Step 2: parallel flush all remaining dirty slices (now just the merged ones)
+        self.cache.flush_dirty().await.map_err(|e| VfsError::Data(e))?;
         Ok(())
     }
 }
