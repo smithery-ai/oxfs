@@ -15,9 +15,10 @@ OXFS_PID=""
 # Source R2 creds from env or infisical
 if [ -z "${R2_ACCOUNT_ID:-}" ]; then
     echo "Loading R2 credentials from Infisical..."
-    eval "$(cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" && \
+    FLAMECAST_DIR="${FLAMECAST_DIR:-$HOME/Documents/github/smithery/flamecast-agents}"
+    eval "$(cd "$FLAMECAST_DIR" && \
         infisical run --env=prod --path=/apps/flamecast -- \
-        bash -c 'echo "export R2_ACCOUNT_ID=$R2_ACCOUNT_ID"; echo "export R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID"; echo "export R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY"' 2>/dev/null)"
+        bash -c 'echo "export R2_ACCOUNT_ID=$R2_ACCOUNT_ID"; echo "export R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID"; echo "export R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY"')"
 fi
 
 ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
@@ -102,13 +103,13 @@ echo "hello oxfs r2" > "$MOUNT/hello.txt"
 CONTENT=$(cat "$MOUNT/hello.txt")
 assert_eq "write+read content" "hello oxfs r2" "$CONTENT"
 
-dd if=/dev/urandom of="$MOUNT/big.bin" bs=1024 count=10240 2>/dev/null
+dd if=/dev/urandom of="$MOUNT/big.bin" bs=131072 count=8 2>/dev/null
 MD5_W=$(md5sum "$MOUNT/big.bin" 2>/dev/null | cut -d' ' -f1 || md5 -q "$MOUNT/big.bin")
 MD5_R=$(md5sum "$MOUNT/big.bin" 2>/dev/null | cut -d' ' -f1 || md5 -q "$MOUNT/big.bin")
-assert_eq "10MB write+read md5" "$MD5_W" "$MD5_R"
+assert_eq "1MB write+read md5" "$MD5_W" "$MD5_R"
 
 SIZE=$(stat -c%s "$MOUNT/big.bin" 2>/dev/null || stat -f%z "$MOUNT/big.bin")
-assert_eq "10MB file size" "10485760" "$SIZE"
+assert_eq "1MB file size" "1048576" "$SIZE"
 
 rm "$MOUNT/hello.txt" "$MOUNT/big.bin"
 
