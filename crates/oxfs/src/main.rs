@@ -6,11 +6,10 @@ use clap::{Parser, Subcommand};
 use opendal::services::{Fs, S3};
 use opendal::Operator;
 
-use oxfs_vfs::PassthroughCache;
 use oxfs_data::OpenDalDataEngine;
 use oxfs_fuse::OxfsFuse;
-use oxfs_meta::SqliteMetaEngine;
-use oxfs_vfs::Vfs;
+use oxfs_meta::{MetaEngine, RedbMetaEngine, SqliteMetaEngine};
+use oxfs_vfs::{PassthroughCache, Vfs};
 
 #[derive(Parser)]
 #[command(name = "oxfs", about = "FUSE filesystem backed by any object store")]
@@ -35,7 +34,33 @@ enum Command {
         endpoint: Option<String>,
         #[arg(long, default_value = "oxfs.db")]
         meta_db: PathBuf,
+        #[arg(long, default_value = "redb")]
+        meta_backend: String,
+        #[arg(long)]
+        default_permissions: bool,
     },
+}
+
+fn mount<M: MetaEngine + 'static>(
+    meta: Arc<M>,
+    op: Operator,
+    mountpoint: &PathBuf,
+    rt: &tokio::runtime::Handle,
+    default_permissions: bool,
+) -> Result<()> {
+    let data = OpenDalDataEngine::new(op);
+    let cache = Arc::new(PassthroughCache::new(data));
+    let vfs = Arc::new(Vfs::new(meta, cache));
+    let fs = OxfsFuse::new(vfs, rt.clone());
+
+    let mut config = fuser::Config::default();
+    config.mount_options.push(fuser::MountOption::FSName("oxfs".into()));
+    if default_permissions {
+        config.mount_options.push(fuser::MountOption::DefaultPermissions);
+    }
+    config.acl = fuser::SessionACL::All;
+    fuser::mount2(fs, mountpoint, &config)?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -47,7 +72,6 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-
     let rt = tokio::runtime::Runtime::new()?;
 
     match cli.command {
@@ -59,6 +83,8 @@ fn main() -> Result<()> {
             region,
             endpoint,
             meta_db,
+            meta_backend,
+            default_permissions,
         } => {
             let op = match backend.as_str() {
                 "fs" => {
@@ -69,33 +95,27 @@ fn main() -> Result<()> {
                 }
                 "s3" => {
                     let mut builder = S3::default();
-                    if let Some(ref b) = bucket {
-                        builder = builder.bucket(b);
-                    }
-                    if let Some(ref r) = region {
-                        builder = builder.region(r);
-                    }
-                    if let Some(ref e) = endpoint {
-                        builder = builder.endpoint(e);
-                    }
+                    if let Some(ref b) = bucket { builder = builder.bucket(b); }
+                    if let Some(ref r) = region { builder = builder.region(r); }
+                    if let Some(ref e) = endpoint { builder = builder.endpoint(e); }
                     Operator::new(builder)?.finish()
                 }
                 other => anyhow::bail!("unsupported backend: {other}"),
             };
 
-            let meta = Arc::new(SqliteMetaEngine::new(&meta_db)?);
-            let data = OpenDalDataEngine::new(op);
-            let cache = Arc::new(PassthroughCache::new(data));
-            let vfs = Arc::new(Vfs::new(meta, cache));
-            let fs = OxfsFuse::new(vfs, rt.handle().clone());
+            tracing::info!("mounting oxfs at {} (meta: {})", mountpoint.display(), meta_backend);
 
-            tracing::info!("mounting oxfs at {}", mountpoint.display());
-
-            let mut config = fuser::Config::default();
-            config.mount_options.push(fuser::MountOption::FSName("oxfs".into()));
-            config.mount_options.push(fuser::MountOption::DefaultPermissions);
-            config.acl = fuser::SessionACL::All;
-            fuser::mount2(fs, &mountpoint, &config)?;
+            match meta_backend.as_str() {
+                "redb" => {
+                    let meta = Arc::new(RedbMetaEngine::new(&meta_db)?);
+                    mount(meta, op, &mountpoint, rt.handle(), default_permissions)?;
+                }
+                "sqlite" => {
+                    let meta = Arc::new(SqliteMetaEngine::new(&meta_db)?);
+                    mount(meta, op, &mountpoint, rt.handle(), default_permissions)?;
+                }
+                other => anyhow::bail!("unsupported meta backend: {other} (use redb or sqlite)"),
+            }
         }
     }
 

@@ -6,7 +6,8 @@ mkdir -p /tmp/oxfs-mount /tmp/oxfs-data
 
 echo "Starting oxfs..."
 /app/target/release/oxfs mount /tmp/oxfs-mount \
-  --backend fs --root /tmp/oxfs-data --meta-db /tmp/oxfs.db &
+  --backend fs --root /tmp/oxfs-data --meta-db /tmp/oxfs.db \
+  --default-permissions &
 OXFS_PID=$!
 sleep 2
 
