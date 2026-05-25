@@ -84,7 +84,7 @@ fn get_attr_locked(conn: &Connection, inode: u64) -> MetaResult<InodeAttr> {
                 uid: row.get::<_, i64>(3)? as u32,
                 gid: row.get::<_, i64>(4)? as u32,
                 size: row.get::<_, i64>(5)? as u64,
-                blocks: (row.get::<_, i64>(5)? as u64 + 511) / 512,
+                blocks: (row.get::<_, i64>(5)? as u64).div_ceil(512),
                 nlink: row.get::<_, i64>(6)? as u32,
                 atime: nanos_to_system_time(row.get(7)?),
                 mtime: nanos_to_system_time(row.get(8)?),

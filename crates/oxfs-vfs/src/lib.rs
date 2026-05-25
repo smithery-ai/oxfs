@@ -256,7 +256,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
     }
 
     pub async fn flush(&self) -> VfsResult<()> {
-        self.cache.flush_dirty().await.map_err(|e| VfsError::Data(e))?;
+        self.cache.flush_dirty().await.map_err(VfsError::Data)?;
         Ok(())
     }
 
@@ -311,7 +311,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
         }
 
         // Step 2: parallel flush all remaining dirty slices (now just the merged ones)
-        self.cache.flush_dirty().await.map_err(|e| VfsError::Data(e))?;
+        self.cache.flush_dirty().await.map_err(VfsError::Data)?;
         Ok(())
     }
 }

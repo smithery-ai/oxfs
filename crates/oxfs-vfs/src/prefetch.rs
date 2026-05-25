@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tokio::task::JoinHandle;
-
 use crate::cache::CacheLayer;
 use oxfs_meta::MetaEngine;
 

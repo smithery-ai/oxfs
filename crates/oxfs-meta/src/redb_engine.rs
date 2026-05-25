@@ -75,7 +75,7 @@ fn to_attr(ino: u64, n: &Node) -> InodeAttr {
         uid: n.uid,
         gid: n.gid,
         size: n.size,
-        blocks: (n.size + 511) / 512,
+        blocks: n.size.div_ceil(512),
         nlink: n.nlink,
         atime: ns2t(n.atime_ns),
         mtime: ns2t(n.mtime_ns),

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -261,10 +261,8 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
 
     async fn flush_dirty(&self) -> DataResult<()> {
         let result = self.flush_dirty_inner().await;
-        if result.is_ok() {
-            if let Some(ref wal) = self.wal {
-                let _ = wal.clear();
-            }
+        if result.is_ok() && let Some(ref wal) = self.wal {
+            let _ = wal.clear();
         }
         result
     }
