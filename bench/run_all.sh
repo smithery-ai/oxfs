@@ -2,7 +2,11 @@
 set -euo pipefail
 
 # Run all FUSE filesystem benchmarks against R2
+# Usage: ./run_all.sh [--durable]
 # Requires: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY in env
+
+DURABLE=false
+if [ "${1:-}" = "--durable" ]; then DURABLE=true; fi
 
 for var in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; do
     if [ -z "${!var:-}" ]; then
@@ -95,19 +99,23 @@ run_bench() {
     echo "\"$name\": $med," >> "$CURRENT_RESULT"
 }
 
+maybe_sync() { if [ "$DURABLE" = true ]; then sync; fi; }
+
 bench_suite() {
     local backend="$1"
-    CURRENT_RESULT="$RESULTS/${backend}.json"
+    local suffix=""; if [ "$DURABLE" = true ]; then suffix="_durable"; fi
+    CURRENT_RESULT="$RESULTS/${backend}${suffix}.json"
     echo "{" > "$CURRENT_RESULT"
 
-    echo "=== $backend ==="
+    local tag=""; if [ "$DURABLE" = true ]; then tag=" [DURABLE]"; fi
+    echo "=== $backend$tag ==="
     mount_backend "$backend"
 
     run_bench "single_file_roundtrip" '
-    echo "hello" > "$MOUNT/s.txt"; cat "$MOUNT/s.txt" >/dev/null; rm "$MOUNT/s.txt"'
+    echo "hello" > "$MOUNT/s.txt"; maybe_sync; cat "$MOUNT/s.txt" >/dev/null; rm "$MOUNT/s.txt"'
 
     run_bench "create_10_files" '
-    for i in $(seq 1 10); do echo "f$i" > "$MOUNT/c$i.txt"; done'
+    for i in $(seq 1 10); do echo "f$i" > "$MOUNT/c$i.txt"; done; maybe_sync'
     rm -f "$MOUNT"/c*.txt 2>/dev/null
 
     for i in $(seq 1 10); do echo "r$i" > "$MOUNT/r$i.txt"; done
@@ -116,7 +124,7 @@ bench_suite() {
     rm -f "$MOUNT"/r*.txt
 
     run_bench "write_256k" '
-    dd if=/dev/urandom of="$MOUNT/w.bin" bs=65536 count=4 2>/dev/null; rm "$MOUNT/w.bin"'
+    dd if=/dev/urandom of="$MOUNT/w.bin" bs=65536 count=4 2>/dev/null; maybe_sync; rm "$MOUNT/w.bin"'
 
     for i in $(seq 1 10); do echo "s" > "$MOUNT/s$i.txt"; done
     run_bench "stat_10" '
@@ -134,7 +142,7 @@ bench_suite() {
     rm -f "$MOUNT"/mv_*.txt
 
     run_bench "symlink_roundtrip" '
-    echo "t" > "$MOUNT/st.txt"; ln -s st.txt "$MOUNT/sl.txt"
+    echo "t" > "$MOUNT/st.txt"; maybe_sync; ln -s st.txt "$MOUNT/sl.txt"
     readlink "$MOUNT/sl.txt" >/dev/null; cat "$MOUNT/sl.txt" >/dev/null
     rm "$MOUNT/sl.txt" "$MOUNT/st.txt"'
 
