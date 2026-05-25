@@ -1,6 +1,6 @@
 # oxfs
 
-FUSE filesystem backed by any object store. Pure Rust.
+FUSE filesystem backed by any object store, written in Rust.
 
 Built on [fuser](https://github.com/cberner/fuser), [redb](https://github.com/cberner/redb), and [Apache OpenDAL](https://github.com/apache/opendal). Faster than tigrisfs, geesefs, and juicefs. 50+ storage backends. 99.6% POSIX compliance. Crash-safe writes with WAL.
 
