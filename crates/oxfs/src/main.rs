@@ -46,6 +46,8 @@ enum Command {
         cache_disk_path: Option<PathBuf>,
         #[arg(long, default_value = "1024")]
         cache_disk_mb: u64,
+        #[arg(long)]
+        wal_path: Option<PathBuf>,
     },
 }
 
@@ -99,6 +101,7 @@ fn main() -> Result<()> {
             cache_mem_mb,
             cache_disk_path,
             cache_disk_mb,
+            wal_path,
         } => {
             let op = match backend.as_str() {
                 "fs" => {
@@ -122,6 +125,7 @@ fn main() -> Result<()> {
                 mem_max_bytes: cache_mem_mb * 1024 * 1024,
                 disk_path: cache_disk_path,
                 disk_max_bytes: cache_disk_mb * 1024 * 1024,
+                wal_path,
             };
 
             tracing::info!(

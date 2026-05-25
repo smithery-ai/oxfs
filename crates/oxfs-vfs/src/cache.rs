@@ -14,6 +14,7 @@ pub trait CacheLayer: Send + Sync {
     async fn write_slice(&self, slice_id: u64, data: Bytes) -> DataResult<()>;
     async fn delete_slice(&self, slice_id: u64) -> DataResult<()>;
     async fn flush_dirty(&self) -> DataResult<()>;
+    async fn replay_wal(&self);
     fn dirty_count(&self) -> usize;
 }
 
@@ -45,6 +46,8 @@ impl<T: DataEngine> CacheLayer for PassthroughCache<T> {
         Ok(())
     }
 
+    async fn replay_wal(&self) {}
+
     fn dirty_count(&self) -> usize { 0 }
 }
 
@@ -52,6 +55,7 @@ pub struct CacheConfig {
     pub mem_max_bytes: u64,
     pub disk_path: Option<PathBuf>,
     pub disk_max_bytes: u64,
+    pub wal_path: Option<PathBuf>,
 }
 
 impl Default for CacheConfig {
@@ -60,6 +64,7 @@ impl Default for CacheConfig {
             mem_max_bytes: 256 * 1024 * 1024,
             disk_path: None,
             disk_max_bytes: 1024 * 1024 * 1024,
+            wal_path: None,
         }
     }
 }
@@ -68,6 +73,7 @@ pub struct TieredCache<D: DataEngine> {
     inner: D,
     l1: Cache<u64, Bytes>,
     dirty: Mutex<HashSet<u64>>,
+    wal: Option<crate::wal::Wal>,
     disk_path: Option<PathBuf>,
     disk_max_bytes: u64,
     disk_used: AtomicU64,
@@ -89,10 +95,17 @@ impl<D: DataEngine> TieredCache<D> {
             let _ = std::fs::create_dir_all(path);
         }
 
+        let wal = config.wal_path.as_ref().and_then(|p| {
+            crate::wal::Wal::open(p)
+                .map_err(|e| tracing::warn!("failed to open WAL at {}: {}", p.display(), e))
+                .ok()
+        });
+
         Self {
             inner,
             l1,
             dirty: Mutex::new(HashSet::new()),
+            wal,
             disk_path: config.disk_path,
             disk_max_bytes: config.disk_max_bytes,
             disk_used: AtomicU64::new(0),
@@ -100,6 +113,60 @@ impl<D: DataEngine> TieredCache<D> {
             l2_hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+
+    async fn flush_dirty_inner(&self) -> DataResult<()> {
+        let to_flush: Vec<u64> = {
+            let mut dirty = self.dirty.lock();
+            dirty.drain().collect()
+        };
+
+        if to_flush.is_empty() {
+            return Ok(());
+        }
+
+        tracing::debug!(count = to_flush.len(), "flushing dirty slices (parallel)");
+
+        let mut items = Vec::with_capacity(to_flush.len());
+        for sid in &to_flush {
+            if let Some(data) = self.l1.get(sid).await {
+                items.push((*sid, data));
+            }
+        }
+
+        let futs: Vec<_> = items.iter().map(|(sid, data)| {
+            let sid = *sid;
+            let data = data.clone();
+            async move {
+                (sid, self.inner.write_slice(sid, data).await)
+            }
+        }).collect();
+
+        let results = futures::future::join_all(futs).await;
+
+        let mut first_error = None;
+        for (sid, result) in results {
+            match result {
+                Ok(()) => {
+                    if let Some(data) = self.l1.get(&sid).await {
+                        self.disk_write(sid, &data).await;
+                    }
+                }
+                Err(e) => {
+                    self.dirty.lock().insert(sid);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+
+        Ok(())
     }
 
     pub fn stats(&self) -> (u64, u64, u64) {
@@ -169,6 +236,9 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
     }
 
     async fn write_slice(&self, slice_id: u64, data: Bytes) -> DataResult<()> {
+        if let Some(ref wal) = self.wal {
+            let _ = wal.append(slice_id, &data);
+        }
         self.l1.insert(slice_id, data.clone()).await;
         self.dirty.lock().insert(slice_id);
         Ok(())
@@ -183,58 +253,33 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
     }
 
     async fn flush_dirty(&self) -> DataResult<()> {
-        let to_flush: Vec<u64> = {
-            let mut dirty = self.dirty.lock();
-            dirty.drain().collect()
+        let result = self.flush_dirty_inner().await;
+        if result.is_ok() {
+            if let Some(ref wal) = self.wal {
+                let _ = wal.clear();
+            }
+        }
+        result
+    }
+
+    async fn replay_wal(&self) {
+        let Some(ref wal) = self.wal else { return };
+        let entries = match wal.read_all() {
+            Ok(e) if e.is_empty() => return,
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("WAL replay read failed: {}", e);
+                return;
+            }
         };
-
-        if to_flush.is_empty() {
-            return Ok(());
+        tracing::info!(count = entries.len(), "replaying WAL entries");
+        for (slice_id, data) in &entries {
+            self.l1.insert(*slice_id, data.clone()).await;
+            self.dirty.lock().insert(*slice_id);
         }
-
-        tracing::debug!(count = to_flush.len(), "flushing dirty slices (parallel)");
-
-        // Collect all (slice_id, data) pairs first
-        let mut items = Vec::with_capacity(to_flush.len());
-        for sid in &to_flush {
-            if let Some(data) = self.l1.get(sid).await {
-                items.push((*sid, data));
-            }
+        if let Err(e) = self.flush_dirty_inner().await {
+            tracing::warn!("WAL replay flush failed: {}", e);
         }
-
-        // Flush all in parallel
-        let futs: Vec<_> = items.iter().map(|(sid, data)| {
-            let sid = *sid;
-            let data = data.clone();
-            async move {
-                (sid, self.inner.write_slice(sid, data).await)
-            }
-        }).collect();
-
-        let results = futures::future::join_all(futs).await;
-
-        let mut first_error = None;
-        for (sid, result) in results {
-            match result {
-                Ok(()) => {
-                    if let Some(data) = self.l1.get(&sid).await {
-                        self.disk_write(sid, &data).await;
-                    }
-                }
-                Err(e) => {
-                    self.dirty.lock().insert(sid);
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-            }
-        }
-
-        if let Some(e) = first_error {
-            return Err(e);
-        }
-
-        Ok(())
     }
 
     fn dirty_count(&self) -> usize {

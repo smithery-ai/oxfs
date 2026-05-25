@@ -1,5 +1,6 @@
 mod cache;
 mod prefetch;
+pub mod wal;
 
 pub use cache::{CacheConfig, CacheLayer, PassthroughCache, TieredCache};
 pub use prefetch::Prefetcher;
@@ -61,6 +62,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
 
     pub async fn init(&self) -> VfsResult<()> {
         self.meta.init().await?;
+        self.cache.replay_wal().await;
         Ok(())
     }
 
