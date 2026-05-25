@@ -1,0 +1,22 @@
+[package]
+name = "oxfs"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "oxfs"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+oxfs-meta = { workspace = true }
+oxfs-data = { workspace = true }
+oxfs-cache = { workspace = true }
+oxfs-vfs = { workspace = true }
+oxfs-fuse = { workspace = true }
+fuser = "0.17"
+opendal = { version = "0.51", features = ["services-fs", "services-s3"] }

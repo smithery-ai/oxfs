@@ -1,0 +1,12 @@
+[package]
+name = "oxfs-cache"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+oxfs-data = { workspace = true }
