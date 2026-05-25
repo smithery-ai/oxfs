@@ -58,14 +58,14 @@ fn mount<M: MetaEngine + 'static>(
     meta: Arc<M>,
     op: Operator,
     mountpoint: &PathBuf,
-    rt: &tokio::runtime::Handle,
     default_permissions: bool,
     cache_config: CacheConfig,
 ) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
     let data = OpenDalDataEngine::new(op);
     let cache = Arc::new(TieredCache::new(data, cache_config));
     let vfs = Arc::new(Vfs::new(meta, cache));
-    let fs = OxfsFuse::new(vfs, rt.clone());
+    let fs = OxfsFuse::new(vfs, rt.handle().clone());
 
     let mut config = fuser::Config::default();
     config.mount_options.push(fuser::MountOption::FSName("oxfs".into()));
@@ -86,7 +86,6 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let rt = tokio::runtime::Runtime::new()?;
 
     match cli.command {
         Command::Mount {
@@ -150,11 +149,11 @@ fn main() -> Result<()> {
             match meta_backend.as_str() {
                 "redb" => {
                     let meta = Arc::new(RedbMetaEngine::new(&meta_db)?);
-                    mount(meta, op, &mountpoint, rt.handle(), default_permissions, cache_config)?;
+                    mount(meta, op, &mountpoint, default_permissions, cache_config)?;
                 }
                 "sqlite" => {
                     let meta = Arc::new(SqliteMetaEngine::new(&meta_db)?);
-                    mount(meta, op, &mountpoint, rt.handle(), default_permissions, cache_config)?;
+                    mount(meta, op, &mountpoint, default_permissions, cache_config)?;
                 }
                 other => anyhow::bail!("unsupported meta backend: {other} (use redb or sqlite)"),
             }
