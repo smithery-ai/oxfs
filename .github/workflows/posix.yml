@@ -2,8 +2,6 @@ name: POSIX Compliance
 
 on:
   workflow_dispatch:
-  release:
-    types: [published]
 
 jobs:
   pjdfstest:
