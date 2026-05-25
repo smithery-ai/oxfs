@@ -32,6 +32,8 @@ enum Command {
         region: Option<String>,
         #[arg(long)]
         endpoint: Option<String>,
+        #[arg(long)]
+        prefix: Option<String>,
         #[arg(long, default_value = "oxfs.db")]
         meta_db: PathBuf,
         #[arg(long, default_value = "redb")]
@@ -89,6 +91,7 @@ fn main() -> Result<()> {
             bucket,
             region,
             endpoint,
+            prefix,
             meta_db,
             meta_backend,
             default_permissions,
@@ -108,6 +111,7 @@ fn main() -> Result<()> {
                     if let Some(ref b) = bucket { builder = builder.bucket(b); }
                     if let Some(ref r) = region { builder = builder.region(r); }
                     if let Some(ref e) = endpoint { builder = builder.endpoint(e); }
+                    if let Some(ref p) = prefix { builder = builder.root(p); }
                     Operator::new(builder)?.finish()
                 }
                 other => anyhow::bail!("unsupported backend: {other}"),
