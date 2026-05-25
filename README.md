@@ -89,10 +89,10 @@ FUSE (fuser) -> VFS -> Cache (moka L1 + disk L2 + WAL) -> Data (OpenDAL)
 
 | Crate | Role |
 |-------|------|
-| oxfs-meta | MetaEngine trait, redb and SQLite impls |
-| oxfs-data | OpenDAL wrapper for slice I/O |
+| oxfs-meta | MetaEngine trait, [redb](https://github.com/cberner/redb) and SQLite impls |
+| oxfs-data | [OpenDAL](https://github.com/apache/opendal) wrapper for slice I/O |
 | oxfs-vfs | Inode mgmt, cache, prefetch, compaction |
-| oxfs-fuse | fuser Filesystem impl |
+| oxfs-fuse | [fuser](https://github.com/cberner/fuser) Filesystem impl |
 | oxfs | CLI binary |
 
 ## License
