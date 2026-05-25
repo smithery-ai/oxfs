@@ -49,11 +49,15 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
 
     pub fn start_background_flusher(self: &Arc<Self>) {
         let vfs = Arc::clone(self);
+        let notify = CacheLayer::flush_signal(vfs.cache.as_ref());
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                // Wait for a write to signal us
+                notify.notified().await;
+                // Coalesce: wait a short window for more writes to batch
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 if vfs.cache.dirty_count() > 0 {
-                    tracing::debug!("background flush tick");
+                    tracing::debug!(dirty = vfs.cache.dirty_count(), "flusher woke");
                     let _ = vfs.cache.flush_dirty().await;
                 }
             }

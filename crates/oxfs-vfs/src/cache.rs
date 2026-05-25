@@ -1,12 +1,14 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use moka::future::Cache;
 use oxfs_data::{DataEngine, DataResult};
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 #[async_trait]
 pub trait CacheLayer: Send + Sync {
@@ -16,6 +18,7 @@ pub trait CacheLayer: Send + Sync {
     async fn flush_dirty(&self) -> DataResult<()>;
     async fn replay_wal(&self);
     fn dirty_count(&self) -> usize;
+    fn flush_signal(&self) -> Arc<Notify>;
 }
 
 pub struct PassthroughCache<D: DataEngine> {
@@ -49,6 +52,8 @@ impl<T: DataEngine> CacheLayer for PassthroughCache<T> {
     async fn replay_wal(&self) {}
 
     fn dirty_count(&self) -> usize { 0 }
+
+    fn flush_signal(&self) -> Arc<Notify> { Arc::new(Notify::new()) }
 }
 
 pub struct CacheConfig {
@@ -74,6 +79,7 @@ pub struct TieredCache<D: DataEngine> {
     l1: Cache<u64, Bytes>,
     dirty: Mutex<HashSet<u64>>,
     wal: Option<crate::wal::Wal>,
+    flush_notify: Arc<Notify>,
     disk_path: Option<PathBuf>,
     disk_max_bytes: u64,
     disk_used: AtomicU64,
@@ -106,6 +112,7 @@ impl<D: DataEngine> TieredCache<D> {
             l1,
             dirty: Mutex::new(HashSet::new()),
             wal,
+            flush_notify: Arc::new(Notify::new()),
             disk_path: config.disk_path,
             disk_max_bytes: config.disk_max_bytes,
             disk_used: AtomicU64::new(0),
@@ -168,6 +175,7 @@ impl<D: DataEngine> TieredCache<D> {
 
         Ok(())
     }
+
 
     pub fn stats(&self) -> (u64, u64, u64) {
         (
@@ -241,6 +249,7 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
         }
         self.l1.insert(slice_id, data.clone()).await;
         self.dirty.lock().insert(slice_id);
+        self.flush_notify.notify_one();
         Ok(())
     }
 
@@ -284,5 +293,9 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
 
     fn dirty_count(&self) -> usize {
         self.dirty.lock().len()
+    }
+
+    fn flush_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.flush_notify)
     }
 }
