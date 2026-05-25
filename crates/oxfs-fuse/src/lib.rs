@@ -30,6 +30,7 @@ fn to_fuse_file_type(ft: FileType) -> FuseFileType {
         FileType::Directory => FuseFileType::Directory,
         FileType::Symlink => FuseFileType::Symlink,
         FileType::Fifo => FuseFileType::NamedPipe,
+        FileType::Socket => FuseFileType::Socket,
     }
 }
 

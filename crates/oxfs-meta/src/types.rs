@@ -10,6 +10,7 @@ pub enum FileType {
     Directory,
     Symlink,
     Fifo,
+    Socket,
 }
 
 #[derive(Debug, Clone)]

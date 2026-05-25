@@ -46,6 +46,7 @@ fn file_type_to_int(ft: FileType) -> i32 {
         FileType::Directory => 2,
         FileType::Symlink => 3,
         FileType::Fifo => 4,
+        FileType::Socket => 5,
     }
 }
 
@@ -54,6 +55,7 @@ fn int_to_file_type(i: i32) -> FileType {
         2 => FileType::Directory,
         3 => FileType::Symlink,
         4 => FileType::Fifo,
+        5 => FileType::Socket,
         _ => FileType::Regular,
     }
 }
@@ -680,12 +682,12 @@ impl MetaEngine for SqliteMetaEngine {
     }
 
     async fn mknod(&self, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> MetaResult<InodeAttr> {
-        // Only support FIFOs; block/char devices need CAP_MKNOD
         let file_type = mode & 0o170000;
         let kind = match file_type {
             0o010000 => FileType::Fifo,    // S_IFIFO
             0o100000 => FileType::Regular, // S_IFREG
-            _ => return Err(MetaError::PermissionDenied),
+            0o140000 => FileType::Socket,  // S_IFSOCK
+            _ => return Err(MetaError::PermissionDenied), // block/char devices need CAP_MKNOD
         };
         let perm = mode & 0o7777;
         self.create(parent, name, kind, perm, uid, gid).await
