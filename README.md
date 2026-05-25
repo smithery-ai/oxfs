@@ -7,8 +7,6 @@ OpenDAL. 99.6% POSIX compliance. Crash-safe writes with WAL.
 
 ## Benchmarks
 
-Same Linux container, same Cloudflare R2 bucket, same workload.
-
 | Metric | oxfs | geesefs | juicefs | vs next best |
 |--------|------|---------|---------|--------------|
 | single file roundtrip | **13ms** | 21ms | 19ms | 1.5x |
