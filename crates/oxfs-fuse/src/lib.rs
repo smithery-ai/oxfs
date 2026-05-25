@@ -451,7 +451,10 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        match self.rt.block_on(self.vfs.flush()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
     }
 
     fn fsync(

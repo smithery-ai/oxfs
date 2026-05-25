@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5,12 +6,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use moka::future::Cache;
 use oxfs_data::{DataEngine, DataResult};
+use parking_lot::Mutex;
 
 #[async_trait]
 pub trait CacheLayer: Send + Sync {
     async fn read_slice(&self, slice_id: u64) -> DataResult<Bytes>;
     async fn write_slice(&self, slice_id: u64, data: Bytes) -> DataResult<()>;
     async fn delete_slice(&self, slice_id: u64) -> DataResult<()>;
+    async fn flush_dirty(&self) -> DataResult<()>;
 }
 
 pub struct PassthroughCache<D: DataEngine> {
@@ -36,6 +39,10 @@ impl<T: DataEngine> CacheLayer for PassthroughCache<T> {
     async fn delete_slice(&self, slice_id: u64) -> DataResult<()> {
         self.inner.delete_slice(slice_id).await
     }
+
+    async fn flush_dirty(&self) -> DataResult<()> {
+        Ok(())
+    }
 }
 
 pub struct CacheConfig {
@@ -47,9 +54,9 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            mem_max_bytes: 256 * 1024 * 1024, // 256 MB
+            mem_max_bytes: 256 * 1024 * 1024,
             disk_path: None,
-            disk_max_bytes: 1024 * 1024 * 1024, // 1 GB
+            disk_max_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -57,6 +64,7 @@ impl Default for CacheConfig {
 pub struct TieredCache<D: DataEngine> {
     inner: D,
     l1: Cache<u64, Bytes>,
+    dirty: Mutex<HashSet<u64>>,
     disk_path: Option<PathBuf>,
     disk_max_bytes: u64,
     disk_used: AtomicU64,
@@ -81,6 +89,7 @@ impl<D: DataEngine> TieredCache<D> {
         Self {
             inner,
             l1,
+            dirty: Mutex::new(HashSet::new()),
             disk_path: config.disk_path,
             disk_max_bytes: config.disk_max_bytes,
             disk_used: AtomicU64::new(0),
@@ -138,7 +147,7 @@ impl<D: DataEngine> TieredCache<D> {
 #[async_trait]
 impl<D: DataEngine> CacheLayer for TieredCache<D> {
     async fn read_slice(&self, slice_id: u64) -> DataResult<Bytes> {
-        // L1 check
+        // L1 check (includes dirty slices not yet flushed)
         if let Some(data) = self.l1.get(&slice_id).await {
             self.l1_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(data);
@@ -160,16 +169,53 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
     }
 
     async fn write_slice(&self, slice_id: u64, data: Bytes) -> DataResult<()> {
-        self.inner.write_slice(slice_id, data.clone()).await?;
+        // Optimistic: write to L1 only, mark dirty
         self.l1.insert(slice_id, data.clone()).await;
-        self.disk_write(slice_id, &data).await;
+        self.dirty.lock().insert(slice_id);
+        tracing::trace!(slice_id, bytes = data.len(), "write_slice (buffered)");
         Ok(())
     }
 
     async fn delete_slice(&self, slice_id: u64) -> DataResult<()> {
-        self.inner.delete_slice(slice_id).await?;
+        self.dirty.lock().remove(&slice_id);
         self.l1.invalidate(&slice_id).await;
         self.disk_delete(slice_id).await;
+        // Best-effort delete from backend (may not exist if never flushed)
+        let _ = self.inner.delete_slice(slice_id).await;
+        Ok(())
+    }
+
+    async fn flush_dirty(&self) -> DataResult<()> {
+        let to_flush: Vec<u64> = {
+            let mut dirty = self.dirty.lock();
+            let ids: Vec<u64> = dirty.drain().collect();
+            ids
+        };
+
+        if to_flush.is_empty() {
+            return Ok(());
+        }
+
+        tracing::debug!(count = to_flush.len(), "flushing dirty slices to backend");
+
+        let mut errors = Vec::new();
+        for slice_id in &to_flush {
+            if let Some(data) = self.l1.get(slice_id).await {
+                if let Err(e) = self.inner.write_slice(*slice_id, data.clone()).await {
+                    // Re-mark as dirty on failure
+                    self.dirty.lock().insert(*slice_id);
+                    errors.push(e);
+                } else {
+                    // Write-through to disk cache on flush
+                    self.disk_write(*slice_id, &data).await;
+                }
+            }
+        }
+
+        if let Some(e) = errors.into_iter().next() {
+            return Err(e);
+        }
+
         Ok(())
     }
 }

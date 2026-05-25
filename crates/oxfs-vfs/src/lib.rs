@@ -223,7 +223,13 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
         Ok(self.meta.statfs().await?)
     }
 
+    pub async fn flush(&self) -> VfsResult<()> {
+        self.cache.flush_dirty().await.map_err(|e| VfsError::Data(e))?;
+        Ok(())
+    }
+
     pub async fn compact_slices(&self, inode: u64) -> VfsResult<()> {
+        self.cache.flush_dirty().await.map_err(|e| VfsError::Data(e))?;
         let chunks = self.meta.get_chunks_for_inode(inode).await?;
 
         for (chunk_idx, slices) in chunks {
