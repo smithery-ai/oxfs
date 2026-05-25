@@ -41,6 +41,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: oxfs-linux-x86_64
           path: target/release/oxfs
