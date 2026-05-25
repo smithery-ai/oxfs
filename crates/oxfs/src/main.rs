@@ -93,6 +93,8 @@ fn main() -> Result<()> {
 
             let mut config = fuser::Config::default();
             config.mount_options.push(fuser::MountOption::FSName("oxfs".into()));
+            config.mount_options.push(fuser::MountOption::DefaultPermissions);
+            config.acl = fuser::SessionACL::All;
             fuser::mount2(fs, &mountpoint, &config)?;
         }
     }

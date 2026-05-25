@@ -20,8 +20,10 @@ COPY crates/ crates/
 RUN cargo build --release
 
 RUN mkdir -p /tmp/oxfs-mount /tmp/oxfs-data
+RUN echo "user_allow_other" >> /etc/fuse.conf
 
 COPY scripts/run-pjdfstest.sh /app/run-pjdfstest.sh
 RUN chmod +x /app/run-pjdfstest.sh
 
-ENTRYPOINT ["/app/run-pjdfstest.sh"]
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["/app/run-pjdfstest.sh"]
