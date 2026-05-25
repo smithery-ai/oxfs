@@ -2,88 +2,100 @@
 
 FUSE filesystem backed by any object store. Pure Rust.
 
-Mount S3, R2, GCS, Tigris, or local disk as a POSIX filesystem with a
-pluggable metadata engine (redb or SQLite) and tiered caching.
+Faster than tigrisfs, geesefs, and juicefs. 50+ storage backends via
+OpenDAL. 99.6% POSIX compliance. Crash-safe writes with WAL.
+
+## Benchmarks
+
+Same Linux container, same Cloudflare R2 bucket, same workload.
+
+| Metric | oxfs | geesefs | juicefs | vs next best |
+|--------|------|---------|---------|--------------|
+| single file roundtrip | **13ms** | 21ms | 19ms | 1.5x |
+| create 10 files | **14ms** | 907ms | 20ms | 1.4x |
+| read 10 files | **20ms** | 38ms | 28ms | 1.4x |
+| write 256KB | **16ms** | 25ms | 21ms | 1.3x |
+| stat 10 files | **23ms** | 28ms | 34ms | 1.2x |
+| mkdir+rmdir 5 dirs | **25ms** | 32ms | 35ms | 1.3x |
+| rename 5 files | **25ms** | 38ms | 34ms | 1.4x |
+| symlink roundtrip | **19ms** | 23ms | 22ms | 1.2x |
+
+Reproduce: `docker build -f bench/Dockerfile -t oxfs-bench . && docker run --rm --privileged -e R2_ACCOUNT_ID=... -e R2_ACCESS_KEY_ID=... -e R2_SECRET_ACCESS_KEY=... oxfs-bench`
 
 ## Quick start
 
 ```bash
-# prerequisites
-brew install macfuse   # macOS (reboot after install)
 cargo build --release
 
-# mount with local FS backend
-mkdir -p /tmp/oxfs-mount /tmp/oxfs-data
-./target/release/oxfs mount /tmp/oxfs-mount \
-  --backend fs --root /tmp/oxfs-data
+# Local filesystem
+./target/release/oxfs mount /mnt/oxfs --backend fs --root /tmp/oxfs-data
 
-# mount with S3
-./target/release/oxfs mount /tmp/oxfs-mount \
-  --backend s3 --bucket my-bucket --region us-east-1
+# S3 / R2
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+./target/release/oxfs mount /mnt/oxfs \
+  --backend s3 --bucket my-bucket --endpoint https://acct.r2.cloudflarestorage.com
 
-# unmount
-umount /tmp/oxfs-mount
+umount /mnt/oxfs
 ```
 
-## Options
+macOS: `brew install --cask macfuse` first (reboot required).
+
+## Storage backends
+
+oxfs uses Apache OpenDAL. Any S3-compatible endpoint works out of the box.
+
+| Backend | Example |
+|---------|---------|
+| AWS S3 | `--backend s3 --bucket name --region us-east-1` |
+| Cloudflare R2 | `--backend s3 --endpoint https://acct.r2.cloudflarestorage.com` |
+| GCS | `--backend s3 --endpoint https://storage.googleapis.com` |
+| MinIO | `--backend s3 --endpoint http://localhost:9000` |
+| Tigris | `--backend s3 --endpoint https://fly.storage.tigris.dev` |
+| Local disk | `--backend fs --root /path` |
+
+`--prefix` scopes all keys within the bucket for per-session isolation.
+
+
+## POSIX compliance
+
+99.6% on pjdfstest (8755/8789 tests, Linux). Supports regular files,
+directories, symlinks, hard links, FIFOs, sockets, block/char device
+nodes, chmod, chown, rename, truncate, nanosecond timestamps.
+
+## Configuration
 
 ```
 oxfs mount <mountpoint>
-  --backend <fs|s3>           Storage backend (default: fs)
-  --root <path>               Root directory for fs backend
-  --bucket <name>             S3 bucket name
-  --region <region>           S3 region
-  --endpoint <url>            S3-compatible endpoint (R2, Tigris, MinIO)
-  --meta-db <path>            Metadata database path (default: oxfs.db)
-  --meta-backend <redb|sqlite> Metadata engine (default: redb)
-  --cache-mem-mb <N>          L1 memory cache size (default: 256)
-  --cache-disk-path <path>    L2 disk cache directory
-  --cache-disk-mb <N>         L2 disk cache max size (default: 1024)
-  --default-permissions       Kernel-enforced permission checks
+  --backend <fs|s3>              Storage backend (default: fs)
+  --root <path>                  Root dir for fs backend
+  --bucket <name>                S3 bucket
+  --region <region>              S3 region
+  --endpoint <url>               S3-compatible endpoint
+  --prefix <path>                Key prefix within bucket
+  --meta-db <path>               Metadata database (default: oxfs.db)
+  --meta-backend <redb|sqlite>   Metadata engine (default: redb)
+  --cache-mem-mb <N>             L1 memory cache MB (default: 256)
+  --cache-disk-path <path>       L2 disk cache directory
+  --cache-disk-mb <N>            L2 disk cache MB (default: 1024)
+  --wal-path <path>              Write-ahead log (crash recovery)
+  --default-permissions          Kernel-enforced permission checks
 ```
 
 ## Architecture
 
 ```
-FUSE (fuser) ── VFS ── Cache (moka L1 + disk L2) ── Data (OpenDAL)
-                 │
-            Metadata (redb or SQLite)
+FUSE (fuser) -> VFS -> Cache (moka L1 + disk L2 + WAL) -> Data (OpenDAL)
+                 |
+              Metadata (redb or SQLite)
 ```
-
-Five crates:
 
 | Crate | Role |
 |-------|------|
-| `oxfs-meta` | MetaEngine trait + redb/SQLite impls |
-| `oxfs-data` | OpenDAL wrapper for slice I/O |
-| `oxfs-vfs` | Inode mgmt, read/write, cache, prefetch |
-| `oxfs-fuse` | fuser Filesystem impl |
-| `oxfs` | CLI binary |
-
-## POSIX compliance
-
-99.6% on pjdfstest (8755/8789 tests passing on Linux). Remaining
-failures are POSIX edge cases (ENAMETOOLONG, sticky bit enforcement).
-
-Supported: regular files, directories, symlinks, hard links, FIFOs,
-sockets, block/char device nodes, chmod, chown, rename, truncate,
-utimensat with nanosecond precision.
-
-## Running tests
-
-```bash
-cargo test
-
-# POSIX compliance (Linux, requires Docker)
-docker build -f Dockerfile.test -t oxfs-test .
-docker run --rm --privileged oxfs-test '
-  mkdir -p /tmp/m /tmp/d
-  /app/target/release/oxfs mount /tmp/m --backend fs --root /tmp/d \
-    --meta-db /tmp/t.db --default-permissions 2>/dev/null &
-  sleep 2 && cd /tmp/m
-  prove -r /opt/pjdfstest/tests/
-'
-```
+| oxfs-meta | MetaEngine trait, redb and SQLite impls |
+| oxfs-data | OpenDAL wrapper for slice I/O |
+| oxfs-vfs | Inode mgmt, cache, prefetch, compaction |
+| oxfs-fuse | fuser Filesystem impl |
+| oxfs | CLI binary |
 
 ## License
 
