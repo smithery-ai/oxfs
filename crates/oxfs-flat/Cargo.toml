@@ -1,0 +1,14 @@
+[package]
+name = "oxfs-flat"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+fuser = "0.17"
+opendal = { version = "0.51", features = ["services-fs", "services-s3"] }
+moka = { version = "0.12", features = ["future"] }
+parking_lot = "0.12"

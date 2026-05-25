@@ -17,6 +17,7 @@ oxfs-meta = { workspace = true }
 oxfs-data = { workspace = true }
 oxfs-vfs = { workspace = true }
 oxfs-fuse = { workspace = true }
+oxfs-flat = { workspace = true }
 fuser = "0.17"
 opendal = { version = "0.51", features = ["services-fs", "services-s3"] }
 daemonize = "0.5"

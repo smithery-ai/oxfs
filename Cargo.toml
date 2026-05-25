@@ -5,6 +5,7 @@ members = [
     "crates/oxfs-data",
     "crates/oxfs-vfs",
     "crates/oxfs-fuse",
+    "crates/oxfs-flat",
     "crates/oxfs",
 ]
 
@@ -26,3 +27,4 @@ oxfs-meta = { path = "crates/oxfs-meta" }
 oxfs-data = { path = "crates/oxfs-data" }
 oxfs-vfs = { path = "crates/oxfs-vfs" }
 oxfs-fuse = { path = "crates/oxfs-fuse" }
+oxfs-flat = { path = "crates/oxfs-flat" }

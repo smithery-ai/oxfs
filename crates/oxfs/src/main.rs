@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -7,6 +8,7 @@ use opendal::services::{Fs, S3};
 use opendal::Operator;
 
 use oxfs_data::OpenDalDataEngine;
+use oxfs_flat::{FlatConfig, FlatFuse};
 use oxfs_fuse::OxfsFuse;
 use oxfs_meta::{MetaEngine, RedbMetaEngine, SqliteMetaEngine};
 use oxfs_vfs::{CacheConfig, TieredCache, Vfs};
@@ -51,6 +53,10 @@ enum Command {
         /// Fork into the background before mounting.
         #[arg(short = 'd', long)]
         daemonize: bool,
+        /// Filesystem mode: "posix" (default) uses meta engine + cache layers;
+        /// "flat" maps S3 keys directly to file paths with no local metadata.
+        #[arg(long, default_value = "posix")]
+        mode: String,
     },
 }
 
@@ -105,6 +111,7 @@ fn main() -> Result<()> {
             cache_disk_mb,
             wal_path,
             daemonize,
+            mode,
         } => {
             let op = match backend.as_str() {
                 "fs" => {
@@ -124,39 +131,71 @@ fn main() -> Result<()> {
                 other => anyhow::bail!("unsupported backend: {other}"),
             };
 
-            let cache_config = CacheConfig {
-                mem_max_bytes: cache_mem_mb * 1024 * 1024,
-                disk_path: cache_disk_path,
-                disk_max_bytes: cache_disk_mb * 1024 * 1024,
-                wal_path,
-            };
+            if mode == "flat" {
+                tracing::info!(
+                    "mounting oxfs (flat mode) at {}",
+                    mountpoint.display(),
+                );
 
-            tracing::info!(
-                "mounting oxfs at {} (meta: {}, cache: {}MB mem{})",
-                mountpoint.display(),
-                meta_backend,
-                cache_mem_mb,
-                cache_config.disk_path.as_ref()
-                    .map(|p| format!(", {}MB disk at {}", cache_disk_mb, p.display()))
-                    .unwrap_or_default(),
-            );
+                let rt = tokio::runtime::Runtime::new()?;
+                let _guard = rt.enter();
 
-            if daemonize {
-                let daemon = daemonize::Daemonize::new()
-                    .working_directory("/");
-                daemon.start()?;
-            }
+                let flat_fuse = FlatFuse::new(
+                    op,
+                    rt.handle().clone(),
+                    FlatConfig {
+                        dir_ttl: Duration::from_secs(1),
+                    },
+                );
 
-            match meta_backend.as_str() {
-                "redb" => {
-                    let meta = Arc::new(RedbMetaEngine::new(&meta_db)?);
-                    mount(meta, op, &mountpoint, default_permissions, cache_config)?;
+                if daemonize {
+                    let daemon = daemonize::Daemonize::new()
+                        .working_directory("/");
+                    daemon.start()?;
                 }
-                "sqlite" => {
-                    let meta = Arc::new(SqliteMetaEngine::new(&meta_db)?);
-                    mount(meta, op, &mountpoint, default_permissions, cache_config)?;
+
+                let mut config = fuser::Config::default();
+                config.mount_options.push(fuser::MountOption::FSName("oxfs".into()));
+                if default_permissions {
+                    config.mount_options.push(fuser::MountOption::DefaultPermissions);
                 }
-                other => anyhow::bail!("unsupported meta backend: {other} (use redb or sqlite)"),
+                config.acl = fuser::SessionACL::All;
+                fuser::mount2(flat_fuse, &mountpoint, &config)?;
+            } else {
+                let cache_config = CacheConfig {
+                    mem_max_bytes: cache_mem_mb * 1024 * 1024,
+                    disk_path: cache_disk_path,
+                    disk_max_bytes: cache_disk_mb * 1024 * 1024,
+                    wal_path,
+                };
+
+                tracing::info!(
+                    "mounting oxfs at {} (meta: {}, cache: {}MB mem{})",
+                    mountpoint.display(),
+                    meta_backend,
+                    cache_mem_mb,
+                    cache_config.disk_path.as_ref()
+                        .map(|p| format!(", {}MB disk at {}", cache_disk_mb, p.display()))
+                        .unwrap_or_default(),
+                );
+
+                if daemonize {
+                    let daemon = daemonize::Daemonize::new()
+                        .working_directory("/");
+                    daemon.start()?;
+                }
+
+                match meta_backend.as_str() {
+                    "redb" => {
+                        let meta = Arc::new(RedbMetaEngine::new(&meta_db)?);
+                        mount(meta, op, &mountpoint, default_permissions, cache_config)?;
+                    }
+                    "sqlite" => {
+                        let meta = Arc::new(SqliteMetaEngine::new(&meta_db)?);
+                        mount(meta, op, &mountpoint, default_permissions, cache_config)?;
+                    }
+                    other => anyhow::bail!("unsupported meta backend: {other} (use redb or sqlite)"),
+                }
             }
         }
     }
