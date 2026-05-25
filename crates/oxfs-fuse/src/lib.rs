@@ -29,6 +29,7 @@ fn to_fuse_file_type(ft: FileType) -> FuseFileType {
         FileType::Regular => FuseFileType::RegularFile,
         FileType::Directory => FuseFileType::Directory,
         FileType::Symlink => FuseFileType::Symlink,
+        FileType::Fifo => FuseFileType::NamedPipe,
     }
 }
 
@@ -59,6 +60,8 @@ fn vfs_err_to_errno(e: &oxfs_vfs::VfsError) -> Errno {
         oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::NotDirectory) => Errno::ENOTDIR,
         oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::NotEmpty) => Errno::ENOTEMPTY,
         oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::IsDirectory) => Errno::EISDIR,
+        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::PermissionDenied) => Errno::EPERM,
+        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::NotSupported) => Errno::ENOSYS,
         oxfs_vfs::VfsError::Invalid(_) => Errno::EINVAL,
         _ => Errno::EIO,
     }
@@ -454,5 +457,53 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
     ) {
         let _ = self.rt.block_on(self.vfs.compact_slices(ino.into()));
         reply.ok();
+    }
+
+    fn access(&self, _req: &Request, _ino: fuser::INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    fn mknod(
+        &self,
+        req: &Request,
+        parent: fuser::INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let name = match name.to_str() {
+            Some(n) => n,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        match self.rt.block_on(self.vfs.mknod(parent.into(), name, mode, req.uid(), req.gid())) {
+            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), fuser::Generation(0)),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        ino: fuser::INodeNo,
+        newparent: fuser::INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let name = match newname.to_str() {
+            Some(n) => n,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        match self.rt.block_on(self.vfs.link(newparent.into(), name, ino.into())) {
+            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), fuser::Generation(0)),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
     }
 }

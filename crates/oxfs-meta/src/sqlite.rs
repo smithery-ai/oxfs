@@ -45,6 +45,7 @@ fn file_type_to_int(ft: FileType) -> i32 {
         FileType::Regular => 1,
         FileType::Directory => 2,
         FileType::Symlink => 3,
+        FileType::Fifo => 4,
     }
 }
 
@@ -52,8 +53,17 @@ fn int_to_file_type(i: i32) -> FileType {
     match i {
         2 => FileType::Directory,
         3 => FileType::Symlink,
+        4 => FileType::Fifo,
         _ => FileType::Regular,
     }
+}
+
+fn touch_parent(conn: &Connection, parent: u64) {
+    let now = system_time_to_secs(SystemTime::now());
+    let _ = conn.execute(
+        "UPDATE node SET mtime = ?1, ctime = ?1 WHERE inode = ?2",
+        rusqlite::params![now, parent as i64],
+    );
 }
 
 fn get_attr_locked(conn: &Connection, inode: u64) -> MetaResult<InodeAttr> {
@@ -286,6 +296,7 @@ impl MetaEngine for SqliteMetaEngine {
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         }
 
+        touch_parent(&conn, parent);
         get_attr_locked(&conn, inode as u64)
     }
 
@@ -328,17 +339,15 @@ impl MetaEngine for SqliteMetaEngine {
             )
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         }
-        if let Some(uid) = req.uid {
+        if req.uid.is_some() || req.gid.is_some() {
+            let cur = get_attr_locked(&conn, inode)?;
+            let new_uid = req.uid.unwrap_or(cur.uid);
+            let new_gid = req.gid.unwrap_or(cur.gid);
+            // POSIX: clear setuid/setgid on chown
+            let cleared_mode = cur.mode & !0o6000;
             conn.execute(
-                "UPDATE node SET uid = ?1, ctime = ?2 WHERE inode = ?3",
-                rusqlite::params![uid as i64, now, inode as i64],
-            )
-            .map_err(|e| MetaError::Internal(e.to_string()))?;
-        }
-        if let Some(gid) = req.gid {
-            conn.execute(
-                "UPDATE node SET gid = ?1, ctime = ?2 WHERE inode = ?3",
-                rusqlite::params![gid as i64, now, inode as i64],
+                "UPDATE node SET uid = ?1, gid = ?2, mode = ?3, ctime = ?4 WHERE inode = ?5",
+                rusqlite::params![new_uid as i64, new_gid as i64, cleared_mode as i64, now, inode as i64],
             )
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         }
@@ -412,6 +421,7 @@ impl MetaEngine for SqliteMetaEngine {
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         }
 
+        touch_parent(&conn, parent);
         Ok(())
     }
 
@@ -485,6 +495,16 @@ impl MetaEngine for SqliteMetaEngine {
                 [dst_parent as i64],
             )
             .map_err(|e| MetaError::Internal(e.to_string()))?;
+        }
+
+        let now = system_time_to_secs(SystemTime::now());
+        let _ = conn.execute(
+            "UPDATE node SET ctime = ?1 WHERE inode = ?2",
+            rusqlite::params![now, attr.inode as i64],
+        );
+        touch_parent(&conn, src_parent);
+        if src_parent != dst_parent {
+            touch_parent(&conn, dst_parent);
         }
 
         Ok(())
@@ -616,6 +636,59 @@ impl MetaEngine for SqliteMetaEngine {
         )
         .map_err(|e| MetaError::Internal(e.to_string()))?;
         Ok(())
+    }
+
+    async fn link(&self, parent: u64, name: &str, inode: u64) -> MetaResult<InodeAttr> {
+        let conn = lock(&self.conn);
+        let attr = get_attr_locked(&conn, inode)?;
+        if attr.kind == FileType::Directory {
+            return Err(MetaError::PermissionDenied);
+        }
+
+        let parent_attr = get_attr_locked(&conn, parent)?;
+        if parent_attr.kind != FileType::Directory {
+            return Err(MetaError::NotDirectory);
+        }
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edge WHERE parent = ?1 AND name = ?2",
+                rusqlite::params![parent as i64, name],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+        if exists {
+            return Err(MetaError::AlreadyExists);
+        }
+
+        conn.execute(
+            "INSERT INTO edge (parent, name, child, kind) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![parent as i64, name, inode as i64, file_type_to_int(attr.kind)],
+        )
+        .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+        let now = system_time_to_secs(SystemTime::now());
+        conn.execute(
+            "UPDATE node SET nlink = nlink + 1, ctime = ?1 WHERE inode = ?2",
+            rusqlite::params![now, inode as i64],
+        )
+        .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+        touch_parent(&conn, parent);
+        get_attr_locked(&conn, inode)
+    }
+
+    async fn mknod(&self, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> MetaResult<InodeAttr> {
+        // Only support FIFOs; block/char devices need CAP_MKNOD
+        let file_type = mode & 0o170000;
+        let kind = match file_type {
+            0o010000 => FileType::Fifo,    // S_IFIFO
+            0o100000 => FileType::Regular, // S_IFREG
+            _ => return Err(MetaError::PermissionDenied),
+        };
+        let perm = mode & 0o7777;
+        self.create(parent, name, kind, perm, uid, gid).await
     }
 }
 

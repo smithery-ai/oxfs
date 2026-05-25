@@ -16,6 +16,10 @@ pub enum MetaError {
     NotEmpty,
     #[error("is a directory")]
     IsDirectory,
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("operation not supported")]
+    NotSupported,
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -61,4 +65,6 @@ pub trait MetaEngine: Send + Sync {
     async fn statfs(&self) -> MetaResult<StatFs>;
     async fn get_chunks_for_inode(&self, inode: u64) -> MetaResult<Vec<(u32, Vec<Slice>)>>;
     async fn replace_slices(&self, inode: u64, chunk_idx: u32, slices: Vec<Slice>) -> MetaResult<()>;
+    async fn link(&self, parent: u64, name: &str, inode: u64) -> MetaResult<InodeAttr>;
+    async fn mknod(&self, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> MetaResult<InodeAttr>;
 }

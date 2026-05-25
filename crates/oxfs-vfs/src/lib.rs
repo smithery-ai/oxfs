@@ -153,6 +153,14 @@ impl<M: MetaEngine, C: CacheLayer> Vfs<M, C> {
         Ok(self.meta.unlink(parent, name).await?)
     }
 
+    pub async fn link(&self, parent: u64, name: &str, inode: u64) -> VfsResult<InodeAttr> {
+        Ok(self.meta.link(parent, name, inode).await?)
+    }
+
+    pub async fn mknod(&self, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> VfsResult<InodeAttr> {
+        Ok(self.meta.mknod(parent, name, mode, uid, gid).await?)
+    }
+
     pub async fn rename(
         &self,
         src_parent: u64,
