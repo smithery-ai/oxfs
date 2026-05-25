@@ -31,18 +31,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  build-linux:
-    name: Build Linux
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+  build:
+    name: Build
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: [check, test]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - uses: actions/upload-artifact@v4
-        continue-on-error: true
-        with:
-          name: oxfs-linux-x86_64
-          path: target/release/oxfs
-          retention-days: 3
