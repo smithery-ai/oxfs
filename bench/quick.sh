@@ -2,9 +2,12 @@
 set -euo pipefail
 
 # Quick oxfs vs tigrisfs benchmark (sized for R2 latency)
-# Usage: ./bench/quick.sh oxfs|tigris
+# Usage: ./bench/quick.sh oxfs|tigris [--durable]
+#   --durable: fsync after writes (measures actual R2 durability, not buffer speed)
 
 BACKEND="${1:-oxfs}"
+DURABLE=false
+if [ "${2:-}" = "--durable" ]; then DURABLE=true; fi
 MOUNT="/tmp/oxfs-qbench"
 META="/tmp/oxfs-qbench.db"
 RESULTS_DIR="$(dirname "$0")/results"
@@ -58,7 +61,15 @@ elif [ "$BACKEND" = "tigris" ]; then
 fi
 
 echo "test" > "$MOUNT/.verify" && cat "$MOUNT/.verify" >/dev/null && rm "$MOUNT/.verify"
-echo "=== $BACKEND benchmark (prefix: $PREFIX) ==="
+
+DURABLE_TAG=""
+if [ "$DURABLE" = true ]; then DURABLE_TAG=" [DURABLE - fsync after writes]"; fi
+echo "=== $BACKEND benchmark (prefix: $PREFIX)$DURABLE_TAG ==="
+
+# fsync helper: forces data to backend when --durable is set
+maybe_sync() {
+    if [ "$DURABLE" = true ]; then sync; fi
+}
 
 time_ms() {
     python3 -c "import time; print(int(time.time()*1000))"
@@ -76,14 +87,17 @@ run_bench() {
     IFS=$'\n' sorted=($(sort -n <<<"${times[*]}")); unset IFS
     local med=${sorted[$((ITERATIONS / 2))]}
     printf "  %-30s %6dms  (runs: %s)\n" "$name" "$med" "${times[*]}"
-    echo "\"$name\": $med," >> "$RESULTS_DIR/${BACKEND}.json"
+    local suffix=""; if [ "$DURABLE" = true ]; then suffix="_durable"; fi
+    echo "\"$name\": $med," >> "$RESULTS_DIR/${BACKEND}${suffix}.json"
 }
 
-echo "{" > "$RESULTS_DIR/${BACKEND}.json"
+SUFFIX=""; if [ "$DURABLE" = true ]; then SUFFIX="_durable"; fi
+echo "{" > "$RESULTS_DIR/${BACKEND}${SUFFIX}.json"
 
 # 1. Single file write+read
 run_bench "single_file_roundtrip" '
 echo "hello benchmark" > "$MOUNT/single.txt"
+maybe_sync
 cat "$MOUNT/single.txt" >/dev/null
 rm "$MOUNT/single.txt"
 '
@@ -91,6 +105,7 @@ rm "$MOUNT/single.txt"
 # 2. Create 10 small files
 run_bench "create_10_files" '
 for i in $(seq 1 10); do echo "f$i" > "$MOUNT/c$i.txt"; done
+maybe_sync
 '
 rm -f "$MOUNT"/c*.txt 2>/dev/null
 
@@ -104,6 +119,7 @@ rm -f "$MOUNT"/r*.txt
 # 4. Write 256KB file
 run_bench "write_256k" '
 dd if=/dev/urandom of="$MOUNT/med.bin" bs=65536 count=4 2>/dev/null
+maybe_sync
 rm "$MOUNT/med.bin"
 '
 
@@ -137,11 +153,12 @@ cat "$MOUNT/sym_lnk.txt" >/dev/null
 rm "$MOUNT/sym_lnk.txt" "$MOUNT/sym_tgt.txt"
 '
 
-sed -i.bak '$ s/,$//' "$RESULTS_DIR/${BACKEND}.json" 2>/dev/null || \
-    sed -i '' '$ s/,$//' "$RESULTS_DIR/${BACKEND}.json"
-echo "}" >> "$RESULTS_DIR/${BACKEND}.json"
-rm -f "$RESULTS_DIR/${BACKEND}.json.bak"
+OUTFILE="$RESULTS_DIR/${BACKEND}${SUFFIX}.json"
+sed -i.bak '$ s/,$//' "$OUTFILE" 2>/dev/null || \
+    sed -i '' '$ s/,$//' "$OUTFILE"
+echo "}" >> "$OUTFILE"
+rm -f "${OUTFILE}.bak"
 
 echo ""
-echo "=== Results: $RESULTS_DIR/${BACKEND}.json ==="
-cat "$RESULTS_DIR/${BACKEND}.json"
+echo "=== Results: $OUTFILE ==="
+cat "$OUTFILE"
