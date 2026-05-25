@@ -5,6 +5,7 @@ pub mod wal;
 pub use cache::{CacheConfig, CacheLayer, PassthroughCache, TieredCache};
 pub use prefetch::Prefetcher;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -28,6 +29,7 @@ pub struct Vfs<M: MetaEngine + 'static, C: CacheLayer + 'static> {
     meta: Arc<M>,
     cache: Arc<C>,
     prefetcher: Prefetcher,
+    dirty_inodes: parking_lot::Mutex<HashSet<u64>>,
 }
 
 impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
@@ -36,6 +38,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
             meta,
             cache,
             prefetcher: Prefetcher::new(4),
+            dirty_inodes: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
@@ -44,6 +47,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
             meta,
             cache,
             prefetcher: Prefetcher::new(prefetch_chunks),
+            dirty_inodes: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
@@ -52,13 +56,18 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
         let notify = CacheLayer::flush_signal(vfs.cache.as_ref());
         tokio::spawn(async move {
             loop {
-                // Wait for a write to signal us
                 notify.notified().await;
-                // Coalesce: wait a short window for more writes to batch
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if vfs.cache.dirty_count() > 0 {
-                    tracing::debug!(dirty = vfs.cache.dirty_count(), "flusher woke");
-                    let _ = vfs.cache.flush_dirty().await;
+                let inodes: Vec<u64> = vfs.dirty_inodes.lock().drain().collect();
+                if inodes.is_empty() {
+                    continue;
+                }
+                tracing::debug!(count = inodes.len(), "flusher: compact+flush inodes");
+                for inode in inodes {
+                    if let Err(e) = vfs.compact_and_flush(inode).await {
+                        tracing::warn!(inode, error = %e, "background flush failed");
+                        vfs.dirty_inodes.lock().insert(inode);
+                    }
                 }
             }
         });
@@ -152,6 +161,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
         }
 
         tracing::debug!(inode, offset, len = data.len(), "write");
+        self.dirty_inodes.lock().insert(inode);
 
         let mut written = 0usize;
         let mut pos = offset;
@@ -248,7 +258,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
     }
 
     pub async fn compact_and_flush(&self, inode: u64) -> VfsResult<()> {
-        // Step 1: compact all chunks for this inode (merge N slices -> 1 per chunk, in L1 only)
+        self.dirty_inodes.lock().remove(&inode);
         let chunks = self.meta.get_chunks_for_inode(inode).await?;
 
         for (chunk_idx, slices) in chunks {
