@@ -1,2 +1,7 @@
 /target
 Cargo.lock
+bench/
+tests/
+scripts/
+Dockerfile.test
+.kindlings/
