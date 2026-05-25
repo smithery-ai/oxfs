@@ -5,7 +5,7 @@ pub mod wal;
 pub use cache::{CacheConfig, CacheLayer, PassthroughCache, TieredCache};
 pub use prefetch::Prefetcher;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -30,6 +30,7 @@ pub struct Vfs<M: MetaEngine + 'static, C: CacheLayer + 'static> {
     cache: Arc<C>,
     prefetcher: Prefetcher,
     dirty_inodes: parking_lot::Mutex<HashSet<u64>>,
+    inode_flush_locks: parking_lot::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
@@ -39,6 +40,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
             cache,
             prefetcher: Prefetcher::new(4),
             dirty_inodes: parking_lot::Mutex::new(HashSet::new()),
+            inode_flush_locks: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -48,6 +50,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
             cache,
             prefetcher: Prefetcher::new(prefetch_chunks),
             dirty_inodes: parking_lot::Mutex::new(HashSet::new()),
+            inode_flush_locks: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -257,7 +260,14 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
         Ok(())
     }
 
+    fn inode_lock(&self, inode: u64) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.inode_flush_locks.lock();
+        locks.entry(inode).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    }
+
     pub async fn compact_and_flush(&self, inode: u64) -> VfsResult<()> {
+        let lock = self.inode_lock(inode);
+        let _guard = lock.lock().await;
         self.dirty_inodes.lock().remove(&inode);
         let chunks = self.meta.get_chunks_for_inode(inode).await?;
 

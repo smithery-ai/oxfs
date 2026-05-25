@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -77,7 +77,7 @@ impl Default for CacheConfig {
 pub struct TieredCache<D: DataEngine> {
     inner: D,
     l1: Cache<u64, Bytes>,
-    dirty: Mutex<HashSet<u64>>,
+    dirty_data: Mutex<HashMap<u64, Bytes>>,
     wal: Option<crate::wal::Wal>,
     flush_notify: Arc<Notify>,
     disk_path: Option<PathBuf>,
@@ -110,7 +110,7 @@ impl<D: DataEngine> TieredCache<D> {
         Self {
             inner,
             l1,
-            dirty: Mutex::new(HashSet::new()),
+            dirty_data: Mutex::new(HashMap::new()),
             wal,
             flush_notify: Arc::new(Notify::new()),
             disk_path: config.disk_path,
@@ -124,44 +124,36 @@ impl<D: DataEngine> TieredCache<D> {
 
 
     async fn flush_dirty_inner(&self) -> DataResult<()> {
-        let to_flush: Vec<u64> = {
-            let mut dirty = self.dirty.lock();
-            dirty.drain().collect()
+        let items: Vec<(u64, Bytes)> = {
+            let mut dd = self.dirty_data.lock();
+            dd.drain().collect()
         };
 
-        if to_flush.is_empty() {
+        if items.is_empty() {
             return Ok(());
         }
 
-        tracing::debug!(count = to_flush.len(), "flushing dirty slices (parallel)");
-
-        let mut items = Vec::with_capacity(to_flush.len());
-        for sid in &to_flush {
-            if let Some(data) = self.l1.get(sid).await {
-                items.push((*sid, data));
-            }
-        }
+        tracing::debug!(count = items.len(), "flushing dirty slices (parallel)");
 
         let futs: Vec<_> = items.iter().map(|(sid, data)| {
             let sid = *sid;
             let data = data.clone();
             async move {
-                (sid, self.inner.write_slice(sid, data).await)
+                (sid, data.clone(), self.inner.write_slice(sid, data).await)
             }
         }).collect();
 
         let results = futures::future::join_all(futs).await;
 
         let mut first_error = None;
-        for (sid, result) in results {
+        for (sid, data, result) in results {
             match result {
                 Ok(()) => {
-                    if let Some(data) = self.l1.get(&sid).await {
-                        self.disk_write(sid, &data).await;
-                    }
+                    self.disk_write(sid, &data).await;
                 }
                 Err(e) => {
-                    self.dirty.lock().insert(sid);
+                    // Re-insert failed slices back into dirty_data
+                    self.dirty_data.lock().insert(sid, data);
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
@@ -225,6 +217,12 @@ impl<D: DataEngine> TieredCache<D> {
 #[async_trait]
 impl<D: DataEngine> CacheLayer for TieredCache<D> {
     async fn read_slice(&self, slice_id: u64) -> DataResult<Bytes> {
+        // Check dirty buffer first (unflushed writes)
+        if let Some(data) = self.dirty_data.lock().get(&slice_id).cloned() {
+            self.l1_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(data);
+        }
+
         if let Some(data) = self.l1.get(&slice_id).await {
             self.l1_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(data);
@@ -248,13 +246,13 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
             let _ = wal.append(slice_id, &data);
         }
         self.l1.insert(slice_id, data.clone()).await;
-        self.dirty.lock().insert(slice_id);
+        self.dirty_data.lock().insert(slice_id, data);
         self.flush_notify.notify_one();
         Ok(())
     }
 
     async fn delete_slice(&self, slice_id: u64) -> DataResult<()> {
-        self.dirty.lock().remove(&slice_id);
+        self.dirty_data.lock().remove(&slice_id);
         self.l1.invalidate(&slice_id).await;
         self.disk_delete(slice_id).await;
         let _ = self.inner.delete_slice(slice_id).await;
@@ -282,9 +280,9 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
             }
         };
         tracing::info!(count = entries.len(), "replaying WAL entries");
-        for (slice_id, data) in &entries {
-            self.l1.insert(*slice_id, data.clone()).await;
-            self.dirty.lock().insert(*slice_id);
+        for (slice_id, data) in entries {
+            self.l1.insert(slice_id, data.clone()).await;
+            self.dirty_data.lock().insert(slice_id, data);
         }
         if let Err(e) = self.flush_dirty_inner().await {
             tracing::warn!("WAL replay flush failed: {}", e);
@@ -292,7 +290,7 @@ impl<D: DataEngine> CacheLayer for TieredCache<D> {
     }
 
     fn dirty_count(&self) -> usize {
-        self.dirty.lock().len()
+        self.dirty_data.lock().len()
     }
 
     fn flush_signal(&self) -> Arc<Notify> {
