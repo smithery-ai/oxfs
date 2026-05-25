@@ -86,6 +86,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
         self.rt
             .block_on(self.vfs.init())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.vfs.start_background_flusher();
         Ok(())
     }
 
@@ -438,8 +439,11 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        // Compact slices on file close
-        let _ = self.rt.block_on(self.vfs.compact_and_flush(ino.into()));
+        let vfs = Arc::clone(&self.vfs);
+        let inode: u64 = ino.into();
+        self.rt.spawn(async move {
+            let _ = vfs.compact_and_flush(inode).await;
+        });
         reply.ok();
     }
 
@@ -451,10 +455,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self.rt.block_on(self.vfs.flush()) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(vfs_err_to_errno(&e)),
-        }
+        reply.ok();
     }
 
     fn fsync(
@@ -465,8 +466,10 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let _ = self.rt.block_on(self.vfs.compact_and_flush(ino.into()));
-        reply.ok();
+        match self.rt.block_on(self.vfs.compact_and_flush(ino.into())) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
     }
 
     fn access(&self, _req: &Request, _ino: fuser::INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
