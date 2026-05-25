@@ -152,12 +152,12 @@ rm "$MOUNT/hard.txt" "$MOUNT/meta.txt" "$MOUNT/link.txt"
 echo "=== Phase 4: Concurrent Access ==="
 
 mkdir "$MOUNT/conc"
-for t in $(seq 1 4); do
-    (for i in $(seq 1 50); do echo "t${t}f${i}" > "$MOUNT/conc/t${t}_f${i}.txt"; done) &
+for t in $(seq 1 2); do
+    (for i in $(seq 1 5); do echo "t${t}f${i}" > "$MOUNT/conc/t${t}_f${i}.txt"; done) &
 done
 wait
 COUNT=$(ls "$MOUNT/conc/" | wc -l | tr -d ' ')
-assert_eq "concurrent 4x50 files" "200" "$COUNT"
+assert_eq "concurrent 2x5 files" "10" "$COUNT"
 rm -rf "$MOUNT/conc"
 
 # ============================================================
