@@ -85,6 +85,8 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
             return Ok(Bytes::new());
         }
 
+        tracing::debug!(inode, offset, size, file_size = attr.size, "read");
+
         let end = std::cmp::min(offset + size as u64, attr.size);
         let mut result = Vec::with_capacity((end - offset) as usize);
         let mut pos = offset;
@@ -130,6 +132,8 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
             return Err(VfsError::Invalid("not a regular file".into()));
         }
 
+        tracing::debug!(inode, offset, len = data.len(), "write");
+
         let mut written = 0usize;
         let mut pos = offset;
 
@@ -142,6 +146,7 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
             let slice_data = Bytes::copy_from_slice(&data[written..written + bytes_in_chunk]);
             let slice_id = self.meta.next_slice_id().await?;
 
+            tracing::trace!(slice_id, bytes = bytes_in_chunk, "PUT slice");
             self.cache.write_slice(slice_id, slice_data).await?;
 
             let slice = Slice {
