@@ -62,6 +62,7 @@ fn mount<M: MetaEngine + 'static>(
     cache_config: CacheConfig,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
+    let _guard = rt.enter();
     let data = OpenDalDataEngine::new(op);
     let cache = Arc::new(TieredCache::new(data, cache_config));
     let vfs = Arc::new(Vfs::new(meta, cache));
