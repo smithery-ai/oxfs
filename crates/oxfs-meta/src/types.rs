@@ -11,6 +11,8 @@ pub enum FileType {
     Symlink,
     Fifo,
     Socket,
+    BlockDevice,
+    CharDevice,
 }
 
 #[derive(Debug, Clone)]
