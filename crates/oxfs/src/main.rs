@@ -64,6 +64,7 @@ fn mount<M: MetaEngine + 'static>(
 
     let mut config = fuser::Config::default();
     config.mount_options.push(fuser::MountOption::FSName("oxfs".into()));
+    config.mount_options.push(fuser::MountOption::CUSTOM("writeback".into()));
     if default_permissions {
         config.mount_options.push(fuser::MountOption::DefaultPermissions);
     }
