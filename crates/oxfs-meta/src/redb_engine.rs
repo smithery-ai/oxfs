@@ -80,6 +80,7 @@ fn to_attr(ino: u64, n: &Node) -> InodeAttr {
         atime: ns2t(n.atime_ns),
         mtime: ns2t(n.mtime_ns),
         ctime: ns2t(n.ctime_ns),
+        rdev: 0,
     }
 }
 
@@ -156,6 +157,7 @@ impl MetaEngine for RedbMetaEngine {
     }
 
     async fn lookup(&self, parent: u64, name: &str) -> MetaResult<InodeAttr> {
+        if name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         let db = lock(&self.db);
         let txn = db.begin_read().map_err(err)?;
         let child_ino = {
@@ -202,6 +204,7 @@ impl MetaEngine for RedbMetaEngine {
         &self, parent: u64, name: &str, kind: FileType,
         mode: u32, uid: u32, gid: u32,
     ) -> MetaResult<InodeAttr> {
+        if name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         let db = lock(&self.db);
         let txn = db.begin_write().map_err(err)?;
 
@@ -312,6 +315,7 @@ impl MetaEngine for RedbMetaEngine {
     }
 
     async fn unlink(&self, parent: u64, name: &str) -> MetaResult<()> {
+        if name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         let db = lock(&self.db);
         let txn = db.begin_write().map_err(err)?;
 
@@ -366,6 +370,7 @@ impl MetaEngine for RedbMetaEngine {
         &self, src_parent: u64, src_name: &str,
         dst_parent: u64, dst_name: &str,
     ) -> MetaResult<()> {
+        if src_name.len() > NAME_MAX || dst_name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         if src_parent == dst_parent && src_name == dst_name { return Ok(()); }
 
         let db = lock(&self.db);
@@ -482,6 +487,7 @@ impl MetaEngine for RedbMetaEngine {
         &self, parent: u64, name: &str, target: &str,
         uid: u32, gid: u32,
     ) -> MetaResult<InodeAttr> {
+        if name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         let db = lock(&self.db);
         let txn = db.begin_write().map_err(err)?;
 
@@ -583,6 +589,7 @@ impl MetaEngine for RedbMetaEngine {
     }
 
     async fn link(&self, parent: u64, name: &str, inode: u64) -> MetaResult<InodeAttr> {
+        if name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         let db = lock(&self.db);
         let txn = db.begin_write().map_err(err)?;
 

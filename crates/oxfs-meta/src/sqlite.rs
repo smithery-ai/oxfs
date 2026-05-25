@@ -89,6 +89,7 @@ fn get_attr_locked(conn: &Connection, inode: u64) -> MetaResult<InodeAttr> {
                 atime: nanos_to_system_time(row.get(7)?),
                 mtime: nanos_to_system_time(row.get(8)?),
                 ctime: nanos_to_system_time(row.get(9)?),
+                rdev: 0,
             })
         },
     )
@@ -213,6 +214,7 @@ impl MetaEngine for SqliteMetaEngine {
     }
 
     async fn lookup(&self, parent: u64, name: &str) -> MetaResult<InodeAttr> {
+        if name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         let conn = lock(&self.conn);
         lookup_locked(&conn, parent, name)
     }
@@ -252,6 +254,9 @@ impl MetaEngine for SqliteMetaEngine {
         uid: u32,
         gid: u32,
     ) -> MetaResult<InodeAttr> {
+        if name.len() > NAME_MAX {
+            return Err(MetaError::NameTooLong);
+        }
         let conn = lock(&self.conn);
         let parent_attr = get_attr_locked(&conn, parent)?;
         if parent_attr.kind != FileType::Directory {
@@ -376,6 +381,7 @@ impl MetaEngine for SqliteMetaEngine {
     }
 
     async fn unlink(&self, parent: u64, name: &str) -> MetaResult<()> {
+        if name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         let conn = lock(&self.conn);
         let attr = lookup_locked(&conn, parent, name)?;
 
@@ -425,7 +431,7 @@ impl MetaEngine for SqliteMetaEngine {
         dst_parent: u64,
         dst_name: &str,
     ) -> MetaResult<()> {
-        // Same source and destination: no-op
+        if src_name.len() > NAME_MAX || dst_name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         if src_parent == dst_parent && src_name == dst_name {
             return Ok(());
         }
@@ -516,6 +522,7 @@ impl MetaEngine for SqliteMetaEngine {
     }
 
     async fn symlink(&self, parent: u64, name: &str, target: &str, uid: u32, gid: u32) -> MetaResult<InodeAttr> {
+        if name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         let conn = lock(&self.conn);
         let parent_attr = get_attr_locked(&conn, parent)?;
         if parent_attr.kind != FileType::Directory {
@@ -632,6 +639,7 @@ impl MetaEngine for SqliteMetaEngine {
     }
 
     async fn link(&self, parent: u64, name: &str, inode: u64) -> MetaResult<InodeAttr> {
+        if name.len() > NAME_MAX { return Err(MetaError::NameTooLong); }
         let conn = lock(&self.conn);
         let attr = get_attr_locked(&conn, inode)?;
         if attr.kind == FileType::Directory {

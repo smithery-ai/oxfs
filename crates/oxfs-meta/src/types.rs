@@ -3,6 +3,7 @@ use std::time::SystemTime;
 
 pub const ROOT_INODE: u64 = 1;
 pub const CHUNK_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
+pub const NAME_MAX: usize = 255;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileType {
@@ -28,6 +29,7 @@ pub struct InodeAttr {
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
+    pub rdev: u32,
 }
 
 impl InodeAttr {
@@ -45,6 +47,7 @@ impl InodeAttr {
             nlink: 2,
             uid,
             gid,
+            rdev: 0,
         }
     }
 
@@ -62,6 +65,7 @@ impl InodeAttr {
             nlink: 1,
             uid,
             gid,
+            rdev: 0,
         }
     }
 }

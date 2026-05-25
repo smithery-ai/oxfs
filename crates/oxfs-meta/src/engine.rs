@@ -20,6 +20,8 @@ pub enum MetaError {
     PermissionDenied,
     #[error("operation not supported")]
     NotSupported,
+    #[error("name too long")]
+    NameTooLong,
     #[error("internal: {0}")]
     Internal(String),
 }

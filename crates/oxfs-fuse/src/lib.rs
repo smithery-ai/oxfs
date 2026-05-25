@@ -65,6 +65,7 @@ fn vfs_err_to_errno(e: &oxfs_vfs::VfsError) -> Errno {
         oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::IsDirectory) => Errno::EISDIR,
         oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::PermissionDenied) => Errno::EPERM,
         oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::NotSupported) => Errno::ENOSYS,
+        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::NameTooLong) => Errno::ENAMETOOLONG,
         oxfs_vfs::VfsError::Invalid(_) => Errno::EINVAL,
         _ => Errno::EIO,
     }
