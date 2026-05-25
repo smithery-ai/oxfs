@@ -521,14 +521,23 @@ impl Filesystem for FlatFuse {
             }
         };
 
-        let end = offset + size as u64;
-        match self.rt.block_on(async {
-            self.op.read_with(&path).range(offset..end).await
-        }) {
-            Ok(data) => reply.data(&data.to_vec()),
+        match self.rt.block_on(async { self.op.read(&path).await }) {
+            Ok(data) => {
+                let bytes = data.to_vec();
+                let start = offset as usize;
+                if start >= bytes.len() {
+                    reply.data(&[]);
+                } else {
+                    let end = std::cmp::min(start + size as usize, bytes.len());
+                    reply.data(&bytes[start..end]);
+                }
+            }
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => reply.error(Errno::ENOENT),
             Err(e) if e.kind() == opendal::ErrorKind::PermissionDenied => reply.error(Errno::EACCES),
-            Err(_) => reply.error(Errno::EIO),
+            Err(e) => {
+                tracing::warn!("read {} failed: {:?}", path, e);
+                reply.error(Errno::EIO);
+            }
         }
     }
 
