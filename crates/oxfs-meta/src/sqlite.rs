@@ -32,12 +32,12 @@ impl SqliteMetaEngine {
     }
 }
 
-fn system_time_to_secs(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() as i64
+fn system_time_to_nanos(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_nanos() as i64
 }
 
-fn secs_to_system_time(secs: i64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(secs as u64)
+fn nanos_to_system_time(nanos: i64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_nanos(nanos as u64)
 }
 
 fn file_type_to_int(ft: FileType) -> i32 {
@@ -59,7 +59,7 @@ fn int_to_file_type(i: i32) -> FileType {
 }
 
 fn touch_parent(conn: &Connection, parent: u64) {
-    let now = system_time_to_secs(SystemTime::now());
+    let now = system_time_to_nanos(SystemTime::now());
     let _ = conn.execute(
         "UPDATE node SET mtime = ?1, ctime = ?1 WHERE inode = ?2",
         rusqlite::params![now, parent as i64],
@@ -80,9 +80,9 @@ fn get_attr_locked(conn: &Connection, inode: u64) -> MetaResult<InodeAttr> {
                 size: row.get::<_, i64>(5)? as u64,
                 blocks: (row.get::<_, i64>(5)? as u64 + 511) / 512,
                 nlink: row.get::<_, i64>(6)? as u32,
-                atime: secs_to_system_time(row.get(7)?),
-                mtime: secs_to_system_time(row.get(8)?),
-                ctime: secs_to_system_time(row.get(9)?),
+                atime: nanos_to_system_time(row.get(7)?),
+                mtime: nanos_to_system_time(row.get(8)?),
+                ctime: nanos_to_system_time(row.get(9)?),
             })
         },
     )
@@ -178,7 +178,7 @@ impl MetaEngine for SqliteMetaEngine {
             .map_err(|e| MetaError::Internal(e.to_string()))?;
 
         if !root_exists {
-            let now = system_time_to_secs(SystemTime::now());
+            let now = system_time_to_nanos(SystemTime::now());
             conn.execute(
                 "INSERT INTO node (inode, kind, mode, uid, gid, size, nlink, atime, mtime, ctime) VALUES (1, 2, 16877, 0, 0, 0, 2, ?1, ?1, ?1)",
                 [now],
@@ -273,7 +273,7 @@ impl MetaEngine for SqliteMetaEngine {
             )
             .map_err(|e| MetaError::Internal(e.to_string()))?;
 
-        let now = system_time_to_secs(SystemTime::now());
+        let now = system_time_to_nanos(SystemTime::now());
         let nlink: i64 = if kind == FileType::Directory { 2 } else { 1 };
 
         conn.execute(
@@ -323,7 +323,7 @@ impl MetaEngine for SqliteMetaEngine {
 
     async fn set_attr(&self, inode: u64, req: SetAttrRequest) -> MetaResult<InodeAttr> {
         let conn = lock(&self.conn);
-        let now = system_time_to_secs(SystemTime::now());
+        let now = system_time_to_nanos(SystemTime::now());
 
         if let Some(new_size) = req.size {
             conn.execute(
@@ -354,14 +354,14 @@ impl MetaEngine for SqliteMetaEngine {
         if let Some(atime) = req.atime {
             conn.execute(
                 "UPDATE node SET atime = ?1 WHERE inode = ?2",
-                rusqlite::params![system_time_to_secs(atime), inode as i64],
+                rusqlite::params![system_time_to_nanos(atime), inode as i64],
             )
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         }
         if let Some(mtime) = req.mtime {
             conn.execute(
                 "UPDATE node SET mtime = ?1, ctime = ?2 WHERE inode = ?3",
-                rusqlite::params![system_time_to_secs(mtime), now, inode as i64],
+                rusqlite::params![system_time_to_nanos(mtime), now, inode as i64],
             )
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         }
@@ -397,21 +397,8 @@ impl MetaEngine for SqliteMetaEngine {
         )
         .map_err(|e| MetaError::Internal(e.to_string()))?;
 
-        // Cascade: remove node, chunks, and slice refs if nlink reaches 0
-        let remaining: i64 = conn
-            .query_row("SELECT nlink FROM node WHERE inode = ?1", [attr.inode as i64], |row| row.get(0))
-            .unwrap_or(1);
-
-        if remaining <= 0 {
-            conn.execute("DELETE FROM chunk WHERE inode = ?1", [attr.inode as i64])
-                .map_err(|e| MetaError::Internal(e.to_string()))?;
-            conn.execute("DELETE FROM xattr WHERE inode = ?1", [attr.inode as i64])
-                .map_err(|e| MetaError::Internal(e.to_string()))?;
-            conn.execute("DELETE FROM symlink WHERE inode = ?1", [attr.inode as i64])
-                .map_err(|e| MetaError::Internal(e.to_string()))?;
-            conn.execute("DELETE FROM node WHERE inode = ?1", [attr.inode as i64])
-                .map_err(|e| MetaError::Internal(e.to_string()))?;
-        }
+        // Node with nlink=0 stays until forget() is called by the kernel
+        // (the kernel keeps the inode alive while any fd is open)
 
         if attr.kind == FileType::Directory {
             conn.execute(
@@ -497,7 +484,7 @@ impl MetaEngine for SqliteMetaEngine {
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         }
 
-        let now = system_time_to_secs(SystemTime::now());
+        let now = system_time_to_nanos(SystemTime::now());
         let _ = conn.execute(
             "UPDATE node SET ctime = ?1 WHERE inode = ?2",
             rusqlite::params![now, attr.inode as i64],
@@ -549,7 +536,7 @@ impl MetaEngine for SqliteMetaEngine {
             )
             .map_err(|e| MetaError::Internal(e.to_string()))?;
 
-        let now = system_time_to_secs(SystemTime::now());
+        let now = system_time_to_nanos(SystemTime::now());
         conn.execute(
             "INSERT INTO node (inode, kind, mode, uid, gid, size, nlink, atime, mtime, ctime) VALUES (?1, 3, 41471, ?2, ?3, ?4, 1, ?5, ?5, ?5)",
             rusqlite::params![inode, uid as i64, gid as i64, target.len() as i64, now],
@@ -668,7 +655,7 @@ impl MetaEngine for SqliteMetaEngine {
         )
         .map_err(|e| MetaError::Internal(e.to_string()))?;
 
-        let now = system_time_to_secs(SystemTime::now());
+        let now = system_time_to_nanos(SystemTime::now());
         conn.execute(
             "UPDATE node SET nlink = nlink + 1, ctime = ?1 WHERE inode = ?2",
             rusqlite::params![now, inode as i64],
@@ -677,6 +664,19 @@ impl MetaEngine for SqliteMetaEngine {
 
         touch_parent(&conn, parent);
         get_attr_locked(&conn, inode)
+    }
+
+    async fn forget(&self, inode: u64) {
+        let conn = lock(&self.conn);
+        let nlink: i64 = conn
+            .query_row("SELECT nlink FROM node WHERE inode = ?1", [inode as i64], |row| row.get(0))
+            .unwrap_or(1);
+        if nlink <= 0 {
+            let _ = conn.execute("DELETE FROM chunk WHERE inode = ?1", [inode as i64]);
+            let _ = conn.execute("DELETE FROM xattr WHERE inode = ?1", [inode as i64]);
+            let _ = conn.execute("DELETE FROM symlink WHERE inode = ?1", [inode as i64]);
+            let _ = conn.execute("DELETE FROM node WHERE inode = ?1", [inode as i64]);
+        }
     }
 
     async fn mknod(&self, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> MetaResult<InodeAttr> {
@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlink_cascades_chunks() {
+    async fn unlink_defers_cleanup_until_forget() {
         let engine = setup().await;
         let attr = engine
             .create(ROOT_INODE, "data", FileType::Regular, 0o644, 0, 0)
@@ -779,11 +779,16 @@ mod tests {
 
         engine.unlink(ROOT_INODE, "data").await.unwrap();
 
-        // Node should be gone
+        // Node still exists with nlink=0 (kernel keeps it alive while fds are open)
+        let after = engine.get_attr(attr.inode).await.unwrap();
+        assert_eq!(after.nlink, 0);
+
+        // Lookup by name should fail
+        assert!(matches!(engine.lookup(ROOT_INODE, "data").await, Err(MetaError::NotFound)));
+
+        // Forget triggers actual cleanup
+        engine.forget(attr.inode).await;
         assert!(matches!(engine.get_attr(attr.inode).await, Err(MetaError::NotFound)));
-        // Chunks should be gone
-        let slices = engine.read_slices(attr.inode, 0).await.unwrap();
-        assert!(slices.is_empty());
     }
 
     #[tokio::test]

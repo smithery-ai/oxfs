@@ -86,6 +86,10 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
         Ok(())
     }
 
+    fn forget(&self, _req: &Request, ino: fuser::INodeNo, _nlookup: u64) {
+        self.rt.block_on(self.vfs.forget(ino.into()));
+    }
+
     fn getattr(
         &self,
         _req: &Request,

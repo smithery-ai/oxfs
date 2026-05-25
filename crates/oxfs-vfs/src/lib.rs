@@ -153,6 +153,10 @@ impl<M: MetaEngine, C: CacheLayer> Vfs<M, C> {
         Ok(self.meta.unlink(parent, name).await?)
     }
 
+    pub async fn forget(&self, inode: u64) {
+        self.meta.forget(inode).await;
+    }
+
     pub async fn link(&self, parent: u64, name: &str, inode: u64) -> VfsResult<InodeAttr> {
         Ok(self.meta.link(parent, name, inode).await?)
     }

@@ -67,4 +67,5 @@ pub trait MetaEngine: Send + Sync {
     async fn replace_slices(&self, inode: u64, chunk_idx: u32, slices: Vec<Slice>) -> MetaResult<()>;
     async fn link(&self, parent: u64, name: &str, inode: u64) -> MetaResult<InodeAttr>;
     async fn mknod(&self, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> MetaResult<InodeAttr>;
+    async fn forget(&self, inode: u64);
 }
