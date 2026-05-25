@@ -2,8 +2,7 @@
 
 FUSE filesystem backed by any object store. Pure Rust.
 
-Faster than tigrisfs, geesefs, and juicefs. 50+ storage backends via
-OpenDAL. 99.6% POSIX compliance. Crash-safe writes with WAL.
+Built on [fuser](https://github.com/cberner/fuser), [redb](https://github.com/cberner/redb), and [Apache OpenDAL](https://github.com/apache/opendal). Faster than tigrisfs, geesefs, and juicefs. 50+ storage backends. 99.6% POSIX compliance. Crash-safe writes with WAL.
 
 ## Benchmarks
 
@@ -40,7 +39,7 @@ macOS: `brew install --cask macfuse` first (reboot required).
 
 ## Storage backends
 
-oxfs uses Apache OpenDAL. Any S3-compatible endpoint works out of the box.
+oxfs uses [Apache OpenDAL](https://github.com/apache/opendal). Any S3-compatible endpoint works out of the box.
 
 | Backend | Example |
 |---------|---------|
