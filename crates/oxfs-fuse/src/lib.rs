@@ -13,12 +13,12 @@ use oxfs_vfs::Vfs;
 
 const TTL: Duration = Duration::from_secs(1);
 
-pub struct OxfsFuse<M: MetaEngine, C: CacheLayer> {
+pub struct OxfsFuse<M: MetaEngine + 'static, C: CacheLayer + 'static> {
     vfs: Arc<Vfs<M, C>>,
     rt: tokio::runtime::Handle,
 }
 
-impl<M: MetaEngine, C: CacheLayer> OxfsFuse<M, C> {
+impl<M: MetaEngine + 'static, C: CacheLayer + 'static> OxfsFuse<M, C> {
     pub fn new(vfs: Arc<Vfs<M, C>>, rt: tokio::runtime::Handle) -> Self {
         Self { vfs, rt }
     }

@@ -1,6 +1,8 @@
 mod cache;
+mod prefetch;
 
 pub use cache::{CacheConfig, CacheLayer, PassthroughCache, TieredCache};
+pub use prefetch::Prefetcher;
 
 use std::sync::Arc;
 
@@ -21,14 +23,27 @@ pub enum VfsError {
 
 pub type VfsResult<T> = std::result::Result<T, VfsError>;
 
-pub struct Vfs<M: MetaEngine, C: CacheLayer> {
+pub struct Vfs<M: MetaEngine + 'static, C: CacheLayer + 'static> {
     meta: Arc<M>,
     cache: Arc<C>,
+    prefetcher: Prefetcher,
 }
 
-impl<M: MetaEngine, C: CacheLayer> Vfs<M, C> {
+impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Vfs<M, C> {
     pub fn new(meta: Arc<M>, cache: Arc<C>) -> Self {
-        Self { meta, cache }
+        Self {
+            meta,
+            cache,
+            prefetcher: Prefetcher::new(4),
+        }
+    }
+
+    pub fn with_prefetch(meta: Arc<M>, cache: Arc<C>, prefetch_chunks: u32) -> Self {
+        Self {
+            meta,
+            cache,
+            prefetcher: Prefetcher::new(prefetch_chunks),
+        }
     }
 
     pub async fn init(&self) -> VfsResult<()> {
@@ -78,6 +93,11 @@ impl<M: MetaEngine, C: CacheLayer> Vfs<M, C> {
             let chunk_idx = (pos / CHUNK_SIZE) as u32;
             let chunk_offset = pos % CHUNK_SIZE;
             let bytes_in_chunk = std::cmp::min(CHUNK_SIZE - chunk_offset, end - pos);
+
+            // Trigger prefetch on sequential access
+            if let Some(chunks) = self.prefetcher.record_and_should_prefetch(inode, chunk_idx) {
+                prefetch::spawn_prefetch(&self.meta, &self.cache, inode, chunks);
+            }
 
             let slices = self.meta.read_slices(inode, chunk_idx).await?;
 
@@ -154,6 +174,7 @@ impl<M: MetaEngine, C: CacheLayer> Vfs<M, C> {
     }
 
     pub async fn forget(&self, inode: u64) {
+        self.prefetcher.remove(inode);
         self.meta.forget(inode).await;
     }
 
@@ -205,7 +226,6 @@ impl<M: MetaEngine, C: CacheLayer> Vfs<M, C> {
                 continue;
             }
 
-            // Replay all slices into a single buffer, then write one merged slice
             let mut max_end = 0u64;
             for s in &slices {
                 max_end = std::cmp::max(max_end, s.offset + s.length);
@@ -233,7 +253,6 @@ impl<M: MetaEngine, C: CacheLayer> Vfs<M, C> {
                 .replace_slices(inode, chunk_idx, vec![merged])
                 .await?;
 
-            // Delete old slice data
             for s in &slices {
                 let _ = self.cache.delete_slice(s.id).await;
             }
