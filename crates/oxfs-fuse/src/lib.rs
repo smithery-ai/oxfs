@@ -1,13 +1,14 @@
 use std::ffi::OsStr;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use fuser::{
     Errno, FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use oxfs_cache::CacheLayer;
-use oxfs_meta::{FileType, MetaEngine};
+use oxfs_vfs::CacheLayer;
+use oxfs_meta::{FileType, MetaEngine, SetAttrRequest};
 use oxfs_vfs::Vfs;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -63,6 +64,13 @@ fn vfs_err_to_errno(e: &oxfs_vfs::VfsError) -> Errno {
     }
 }
 
+fn time_or_now_to_system_time(t: TimeOrNow) -> SystemTime {
+    match t {
+        TimeOrNow::SpecificTime(st) => st,
+        TimeOrNow::Now => SystemTime::now(),
+    }
+}
+
 impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M, C> {
     fn init(
         &mut self,
@@ -83,6 +91,38 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
         reply: ReplyAttr,
     ) {
         match self.rt.block_on(self.vfs.get_attr(ino.into())) {
+            Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr)),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: fuser::INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<fuser::FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let req = SetAttrRequest {
+            size,
+            mode,
+            uid,
+            gid,
+            atime: atime.map(time_or_now_to_system_time),
+            mtime: mtime.map(time_or_now_to_system_time),
+        };
+        match self.rt.block_on(self.vfs.set_attr(ino.into(), req)) {
             Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr)),
             Err(e) => reply.error(vfs_err_to_errno(&e)),
         }
@@ -318,5 +358,101 @@ impl<M: MetaEngine + 'static, C: CacheLayer + 'static> Filesystem for OxfsFuse<M
             Ok(()) => reply.ok(),
             Err(e) => reply.error(vfs_err_to_errno(&e)),
         }
+    }
+
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: fuser::INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let name = match link_name.to_str() {
+            Some(n) => n,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        let target = match target.to_str() {
+            Some(t) => t,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        match self
+            .rt
+            .block_on(self.vfs.symlink(parent.into(), name, target, req.uid(), req.gid()))
+        {
+            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), fuser::Generation(0)),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: fuser::INodeNo, reply: ReplyData) {
+        match self.rt.block_on(self.vfs.readlink(ino.into())) {
+            Ok(target) => reply.data(target.as_bytes()),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
+    }
+
+    fn statfs(&self, _req: &Request, _ino: fuser::INodeNo, reply: ReplyStatfs) {
+        match self.rt.block_on(self.vfs.statfs()) {
+            Ok(st) => reply.statfs(
+                st.blocks,
+                st.bfree,
+                st.bavail,
+                st.files,
+                st.ffree,
+                st.bsize,
+                st.namelen,
+                0,
+            ),
+            Err(e) => reply.error(vfs_err_to_errno(&e)),
+        }
+    }
+
+    fn open(&self, _req: &Request, _ino: fuser::INodeNo, _flags: fuser::OpenFlags, reply: fuser::ReplyOpen) {
+        reply.opened(fuser::FileHandle(0), fuser::FopenFlags::empty());
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        ino: fuser::INodeNo,
+        _fh: fuser::FileHandle,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Compact slices on file close
+        let _ = self.rt.block_on(self.vfs.compact_slices(ino.into()));
+        reply.ok();
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: fuser::INodeNo,
+        _fh: fuser::FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: fuser::INodeNo,
+        _fh: fuser::FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let _ = self.rt.block_on(self.vfs.compact_slices(ino.into()));
+        reply.ok();
     }
 }

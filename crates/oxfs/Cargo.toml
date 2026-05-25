@@ -15,7 +15,6 @@ anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 oxfs-meta = { workspace = true }
 oxfs-data = { workspace = true }
-oxfs-cache = { workspace = true }
 oxfs-vfs = { workspace = true }
 oxfs-fuse = { workspace = true }
 fuser = "0.17"

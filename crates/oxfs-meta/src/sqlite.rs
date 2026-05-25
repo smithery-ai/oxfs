@@ -1,16 +1,15 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use rusqlite::Connection;
-use tokio::sync::Mutex;
 
 use crate::engine::*;
 use crate::types::*;
 
 pub struct SqliteMetaEngine {
-    conn: Arc<Mutex<Connection>>,
+    conn: Mutex<Connection>,
 }
 
 impl SqliteMetaEngine {
@@ -20,7 +19,7 @@ impl SqliteMetaEngine {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Mutex::new(conn),
         })
     }
 
@@ -28,7 +27,7 @@ impl SqliteMetaEngine {
         let conn = Connection::open_in_memory()
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Mutex::new(conn),
         })
     }
 }
@@ -57,10 +56,65 @@ fn int_to_file_type(i: i32) -> FileType {
     }
 }
 
+fn get_attr_locked(conn: &Connection, inode: u64) -> MetaResult<InodeAttr> {
+    conn.query_row(
+        "SELECT inode, kind, mode, uid, gid, size, nlink, atime, mtime, ctime FROM node WHERE inode = ?1",
+        [inode as i64],
+        |row| {
+            Ok(InodeAttr {
+                inode: row.get::<_, i64>(0)? as u64,
+                kind: int_to_file_type(row.get(1)?),
+                mode: row.get::<_, i64>(2)? as u32,
+                uid: row.get::<_, i64>(3)? as u32,
+                gid: row.get::<_, i64>(4)? as u32,
+                size: row.get::<_, i64>(5)? as u64,
+                blocks: (row.get::<_, i64>(5)? as u64 + 511) / 512,
+                nlink: row.get::<_, i64>(6)? as u32,
+                atime: secs_to_system_time(row.get(7)?),
+                mtime: secs_to_system_time(row.get(8)?),
+                ctime: secs_to_system_time(row.get(9)?),
+            })
+        },
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => MetaError::NotFound,
+        _ => MetaError::Internal(e.to_string()),
+    })
+}
+
+fn lookup_locked(conn: &Connection, parent: u64, name: &str) -> MetaResult<InodeAttr> {
+    let child_inode: i64 = conn
+        .query_row(
+            "SELECT child FROM edge WHERE parent = ?1 AND name = ?2",
+            rusqlite::params![parent as i64, name],
+            |row| row.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => MetaError::NotFound,
+            _ => MetaError::Internal(e.to_string()),
+        })?;
+    get_attr_locked(conn, child_inode as u64)
+}
+
+fn read_slices_locked(conn: &Connection, inode: u64, chunk_idx: u32) -> MetaResult<Vec<Slice>> {
+    let json: String = conn
+        .query_row(
+            "SELECT slices FROM chunk WHERE inode = ?1 AND chunk_idx = ?2",
+            rusqlite::params![inode as i64, chunk_idx as i64],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+    serde_json::from_str(&json).map_err(|e| MetaError::Internal(e.to_string()))
+}
+
+fn lock(conn: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
+    conn.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[async_trait]
 impl MetaEngine for SqliteMetaEngine {
     async fn init(&self) -> MetaResult<()> {
-        let conn = self.conn.lock().await;
+        let conn = lock(&self.conn);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS node (
                 inode   INTEGER PRIMARY KEY,
@@ -108,7 +162,6 @@ impl MetaEngine for SqliteMetaEngine {
         )
         .map_err(|e| MetaError::Internal(e.to_string()))?;
 
-        // Seed root inode if missing
         let root_exists: bool = conn
             .query_row("SELECT COUNT(*) FROM node WHERE inode = 1", [], |row| row.get::<_, i64>(0))
             .map(|c| c > 0)
@@ -139,55 +192,22 @@ impl MetaEngine for SqliteMetaEngine {
     }
 
     async fn get_attr(&self, inode: u64) -> MetaResult<InodeAttr> {
-        let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT inode, kind, mode, uid, gid, size, nlink, atime, mtime, ctime FROM node WHERE inode = ?1",
-            [inode as i64],
-            |row| {
-                Ok(InodeAttr {
-                    inode: row.get::<_, i64>(0)? as u64,
-                    kind: int_to_file_type(row.get(1)?),
-                    mode: row.get::<_, i64>(2)? as u32,
-                    uid: row.get::<_, i64>(3)? as u32,
-                    gid: row.get::<_, i64>(4)? as u32,
-                    size: row.get::<_, i64>(5)? as u64,
-                    blocks: (row.get::<_, i64>(5)? as u64 + 511) / 512,
-                    nlink: row.get::<_, i64>(6)? as u32,
-                    atime: secs_to_system_time(row.get(7)?),
-                    mtime: secs_to_system_time(row.get(8)?),
-                    ctime: secs_to_system_time(row.get(9)?),
-                })
-            },
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => MetaError::NotFound,
-            _ => MetaError::Internal(e.to_string()),
-        })
+        let conn = lock(&self.conn);
+        get_attr_locked(&conn, inode)
     }
 
     async fn lookup(&self, parent: u64, name: &str) -> MetaResult<InodeAttr> {
-        let conn = self.conn.lock().await;
-        let child_inode: i64 = conn
-            .query_row(
-                "SELECT child FROM edge WHERE parent = ?1 AND name = ?2",
-                rusqlite::params![parent as i64, name],
-                |row| row.get(0),
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => MetaError::NotFound,
-                _ => MetaError::Internal(e.to_string()),
-            })?;
-        drop(conn);
-        self.get_attr(child_inode as u64).await
+        let conn = lock(&self.conn);
+        lookup_locked(&conn, parent, name)
     }
 
     async fn readdir(&self, inode: u64) -> MetaResult<Vec<DirEntry>> {
-        let attr = self.get_attr(inode).await?;
+        let conn = lock(&self.conn);
+        let attr = get_attr_locked(&conn, inode)?;
         if attr.kind != FileType::Directory {
             return Err(MetaError::NotDirectory);
         }
 
-        let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare("SELECT child, name, kind FROM edge WHERE parent = ?1")
             .map_err(|e| MetaError::Internal(e.to_string()))?;
@@ -216,14 +236,12 @@ impl MetaEngine for SqliteMetaEngine {
         uid: u32,
         gid: u32,
     ) -> MetaResult<InodeAttr> {
-        let parent_attr = self.get_attr(parent).await?;
+        let conn = lock(&self.conn);
+        let parent_attr = get_attr_locked(&conn, parent)?;
         if parent_attr.kind != FileType::Directory {
             return Err(MetaError::NotDirectory);
         }
 
-        let conn = self.conn.lock().await;
-
-        // Check for duplicates
         let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) FROM edge WHERE parent = ?1 AND name = ?2",
@@ -237,7 +255,6 @@ impl MetaEngine for SqliteMetaEngine {
             return Err(MetaError::AlreadyExists);
         }
 
-        // Allocate inode
         let inode: i64 = conn
             .query_row(
                 "UPDATE counter SET value = value + 1 WHERE name = 'next_inode' RETURNING value",
@@ -269,29 +286,20 @@ impl MetaEngine for SqliteMetaEngine {
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         }
 
-        drop(conn);
-        self.get_attr(inode as u64).await
+        get_attr_locked(&conn, inode as u64)
     }
 
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> MetaResult<Vec<Slice>> {
-        let conn = self.conn.lock().await;
-        let json: String = conn
-            .query_row(
-                "SELECT slices FROM chunk WHERE inode = ?1 AND chunk_idx = ?2",
-                rusqlite::params![inode as i64, chunk_idx as i64],
-                |row| row.get(0),
-            )
-            .unwrap_or_else(|_| "[]".to_string());
-
-        serde_json::from_str(&json).map_err(|e| MetaError::Internal(e.to_string()))
+        let conn = lock(&self.conn);
+        read_slices_locked(&conn, inode, chunk_idx)
     }
 
     async fn write_slice(&self, inode: u64, chunk_idx: u32, slice: Slice) -> MetaResult<()> {
-        let mut slices = self.read_slices(inode, chunk_idx).await?;
+        let conn = lock(&self.conn);
+        let mut slices = read_slices_locked(&conn, inode, chunk_idx)?;
         slices.push(slice);
         let json = serde_json::to_string(&slices).map_err(|e| MetaError::Internal(e.to_string()))?;
 
-        let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO chunk (inode, chunk_idx, slices) VALUES (?1, ?2, ?3)
              ON CONFLICT (inode, chunk_idx) DO UPDATE SET slices = ?3",
@@ -302,29 +310,72 @@ impl MetaEngine for SqliteMetaEngine {
         Ok(())
     }
 
-    async fn set_attr(&self, inode: u64, size: Option<u64>) -> MetaResult<InodeAttr> {
-        if let Some(new_size) = size {
-            let conn = self.conn.lock().await;
-            let now = system_time_to_secs(SystemTime::now());
+    async fn set_attr(&self, inode: u64, req: SetAttrRequest) -> MetaResult<InodeAttr> {
+        let conn = lock(&self.conn);
+        let now = system_time_to_secs(SystemTime::now());
+
+        if let Some(new_size) = req.size {
             conn.execute(
                 "UPDATE node SET size = ?1, mtime = ?2, ctime = ?2 WHERE inode = ?3",
                 rusqlite::params![new_size as i64, now, inode as i64],
             )
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         }
-        self.get_attr(inode).await
+        if let Some(mode) = req.mode {
+            conn.execute(
+                "UPDATE node SET mode = ?1, ctime = ?2 WHERE inode = ?3",
+                rusqlite::params![mode as i64, now, inode as i64],
+            )
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+        }
+        if let Some(uid) = req.uid {
+            conn.execute(
+                "UPDATE node SET uid = ?1, ctime = ?2 WHERE inode = ?3",
+                rusqlite::params![uid as i64, now, inode as i64],
+            )
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+        }
+        if let Some(gid) = req.gid {
+            conn.execute(
+                "UPDATE node SET gid = ?1, ctime = ?2 WHERE inode = ?3",
+                rusqlite::params![gid as i64, now, inode as i64],
+            )
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+        }
+        if let Some(atime) = req.atime {
+            conn.execute(
+                "UPDATE node SET atime = ?1 WHERE inode = ?2",
+                rusqlite::params![system_time_to_secs(atime), inode as i64],
+            )
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+        }
+        if let Some(mtime) = req.mtime {
+            conn.execute(
+                "UPDATE node SET mtime = ?1, ctime = ?2 WHERE inode = ?3",
+                rusqlite::params![system_time_to_secs(mtime), now, inode as i64],
+            )
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+        }
+
+        get_attr_locked(&conn, inode)
     }
 
     async fn unlink(&self, parent: u64, name: &str) -> MetaResult<()> {
-        let attr = self.lookup(parent, name).await?;
+        let conn = lock(&self.conn);
+        let attr = lookup_locked(&conn, parent, name)?;
+
         if attr.kind == FileType::Directory {
-            let children = self.readdir(attr.inode).await?;
-            if !children.is_empty() {
+            let mut stmt = conn
+                .prepare("SELECT COUNT(*) FROM edge WHERE parent = ?1")
+                .map_err(|e| MetaError::Internal(e.to_string()))?;
+            let count: i64 = stmt
+                .query_row([attr.inode as i64], |row| row.get(0))
+                .map_err(|e| MetaError::Internal(e.to_string()))?;
+            if count > 0 {
                 return Err(MetaError::NotEmpty);
             }
         }
 
-        let conn = self.conn.lock().await;
         conn.execute(
             "DELETE FROM edge WHERE parent = ?1 AND name = ?2",
             rusqlite::params![parent as i64, name],
@@ -337,12 +388,21 @@ impl MetaEngine for SqliteMetaEngine {
         )
         .map_err(|e| MetaError::Internal(e.to_string()))?;
 
-        // Remove node if nlink reaches 0
-        conn.execute(
-            "DELETE FROM node WHERE inode = ?1 AND nlink <= 0",
-            [attr.inode as i64],
-        )
-        .map_err(|e| MetaError::Internal(e.to_string()))?;
+        // Cascade: remove node, chunks, and slice refs if nlink reaches 0
+        let remaining: i64 = conn
+            .query_row("SELECT nlink FROM node WHERE inode = ?1", [attr.inode as i64], |row| row.get(0))
+            .unwrap_or(1);
+
+        if remaining <= 0 {
+            conn.execute("DELETE FROM chunk WHERE inode = ?1", [attr.inode as i64])
+                .map_err(|e| MetaError::Internal(e.to_string()))?;
+            conn.execute("DELETE FROM xattr WHERE inode = ?1", [attr.inode as i64])
+                .map_err(|e| MetaError::Internal(e.to_string()))?;
+            conn.execute("DELETE FROM symlink WHERE inode = ?1", [attr.inode as i64])
+                .map_err(|e| MetaError::Internal(e.to_string()))?;
+            conn.execute("DELETE FROM node WHERE inode = ?1", [attr.inode as i64])
+                .map_err(|e| MetaError::Internal(e.to_string()))?;
+        }
 
         if attr.kind == FileType::Directory {
             conn.execute(
@@ -362,14 +422,52 @@ impl MetaEngine for SqliteMetaEngine {
         dst_parent: u64,
         dst_name: &str,
     ) -> MetaResult<()> {
-        let attr = self.lookup(src_parent, src_name).await?;
-
-        // Remove destination if it exists
-        if self.lookup(dst_parent, dst_name).await.is_ok() {
-            self.unlink(dst_parent, dst_name).await?;
+        // Same source and destination: no-op
+        if src_parent == dst_parent && src_name == dst_name {
+            return Ok(());
         }
 
-        let conn = self.conn.lock().await;
+        let conn = lock(&self.conn);
+        let attr = lookup_locked(&conn, src_parent, src_name)?;
+
+        // Remove destination if it exists (within same lock)
+        if let Ok(dst_attr) = lookup_locked(&conn, dst_parent, dst_name) {
+            if dst_attr.kind == FileType::Directory {
+                let count: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM edge WHERE parent = ?1", [dst_attr.inode as i64], |row| row.get(0))
+                    .map_err(|e| MetaError::Internal(e.to_string()))?;
+                if count > 0 {
+                    return Err(MetaError::NotEmpty);
+                }
+            }
+
+            conn.execute(
+                "DELETE FROM edge WHERE parent = ?1 AND name = ?2",
+                rusqlite::params![dst_parent as i64, dst_name],
+            )
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+            conn.execute(
+                "UPDATE node SET nlink = nlink - 1 WHERE inode = ?1",
+                [dst_attr.inode as i64],
+            )
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+            conn.execute(
+                "DELETE FROM node WHERE inode = ?1 AND nlink <= 0",
+                [dst_attr.inode as i64],
+            )
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+            if dst_attr.kind == FileType::Directory {
+                conn.execute(
+                    "UPDATE node SET nlink = nlink - 1 WHERE inode = ?1",
+                    [dst_parent as i64],
+                )
+                .map_err(|e| MetaError::Internal(e.to_string()))?;
+            }
+        }
+
         conn.execute(
             "UPDATE edge SET parent = ?1, name = ?2 WHERE parent = ?3 AND name = ?4",
             rusqlite::params![dst_parent as i64, dst_name, src_parent as i64, src_name],
@@ -393,7 +491,7 @@ impl MetaEngine for SqliteMetaEngine {
     }
 
     async fn next_slice_id(&self) -> MetaResult<u64> {
-        let conn = self.conn.lock().await;
+        let conn = lock(&self.conn);
         let id: i64 = conn
             .query_row(
                 "UPDATE counter SET value = value + 1 WHERE name = 'next_slice' RETURNING value",
@@ -402,6 +500,122 @@ impl MetaEngine for SqliteMetaEngine {
             )
             .map_err(|e| MetaError::Internal(e.to_string()))?;
         Ok(id as u64)
+    }
+
+    async fn symlink(&self, parent: u64, name: &str, target: &str, uid: u32, gid: u32) -> MetaResult<InodeAttr> {
+        let conn = lock(&self.conn);
+        let parent_attr = get_attr_locked(&conn, parent)?;
+        if parent_attr.kind != FileType::Directory {
+            return Err(MetaError::NotDirectory);
+        }
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edge WHERE parent = ?1 AND name = ?2",
+                rusqlite::params![parent as i64, name],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+        if exists {
+            return Err(MetaError::AlreadyExists);
+        }
+
+        let inode: i64 = conn
+            .query_row(
+                "UPDATE counter SET value = value + 1 WHERE name = 'next_inode' RETURNING value",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+        let now = system_time_to_secs(SystemTime::now());
+        conn.execute(
+            "INSERT INTO node (inode, kind, mode, uid, gid, size, nlink, atime, mtime, ctime) VALUES (?1, 3, 41471, ?2, ?3, ?4, 1, ?5, ?5, ?5)",
+            rusqlite::params![inode, uid as i64, gid as i64, target.len() as i64, now],
+        )
+        .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+        conn.execute(
+            "INSERT INTO symlink (inode, target) VALUES (?1, ?2)",
+            rusqlite::params![inode, target],
+        )
+        .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+        conn.execute(
+            "INSERT INTO edge (parent, name, child, kind) VALUES (?1, ?2, ?3, 3)",
+            rusqlite::params![parent as i64, name, inode],
+        )
+        .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+        get_attr_locked(&conn, inode as u64)
+    }
+
+    async fn readlink(&self, inode: u64) -> MetaResult<String> {
+        let conn = lock(&self.conn);
+        conn.query_row(
+            "SELECT target FROM symlink WHERE inode = ?1",
+            [inode as i64],
+            |row| row.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => MetaError::NotFound,
+            _ => MetaError::Internal(e.to_string()),
+        })
+    }
+
+    async fn statfs(&self) -> MetaResult<StatFs> {
+        let conn = lock(&self.conn);
+        let files: u64 = conn
+            .query_row("SELECT COUNT(*) FROM node", [], |row| row.get::<_, i64>(0))
+            .map(|c| c as u64)
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+        Ok(StatFs {
+            blocks: 1 << 20,
+            bfree: 1 << 19,
+            bavail: 1 << 19,
+            files,
+            ffree: u64::MAX - files,
+            bsize: 4096,
+            namelen: 255,
+        })
+    }
+
+    async fn get_chunks_for_inode(&self, inode: u64) -> MetaResult<Vec<(u32, Vec<Slice>)>> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn
+            .prepare("SELECT chunk_idx, slices FROM chunk WHERE inode = ?1")
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([inode as i64], |row| {
+                let idx: i64 = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((idx as u32, json))
+            })
+            .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let (idx, json) = row.map_err(|e| MetaError::Internal(e.to_string()))?;
+            let slices: Vec<Slice> = serde_json::from_str(&json)
+                .map_err(|e| MetaError::Internal(e.to_string()))?;
+            result.push((idx, slices));
+        }
+        Ok(result)
+    }
+
+    async fn replace_slices(&self, inode: u64, chunk_idx: u32, slices: Vec<Slice>) -> MetaResult<()> {
+        let conn = lock(&self.conn);
+        let json = serde_json::to_string(&slices).map_err(|e| MetaError::Internal(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO chunk (inode, chunk_idx, slices) VALUES (?1, ?2, ?3)
+             ON CONFLICT (inode, chunk_idx) DO UPDATE SET slices = ?3",
+            rusqlite::params![inode as i64, chunk_idx as i64, json],
+        )
+        .map_err(|e| MetaError::Internal(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -481,6 +695,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlink_cascades_chunks() {
+        let engine = setup().await;
+        let attr = engine
+            .create(ROOT_INODE, "data", FileType::Regular, 0o644, 0, 0)
+            .await
+            .unwrap();
+        let slice = Slice { id: 1, offset: 0, length: 100 };
+        engine.write_slice(attr.inode, 0, slice).await.unwrap();
+
+        engine.unlink(ROOT_INODE, "data").await.unwrap();
+
+        // Node should be gone
+        assert!(matches!(engine.get_attr(attr.inode).await, Err(MetaError::NotFound)));
+        // Chunks should be gone
+        let slices = engine.read_slices(attr.inode, 0).await.unwrap();
+        assert!(slices.is_empty());
+    }
+
+    #[tokio::test]
     async fn rename_file() {
         let engine = setup().await;
         engine
@@ -496,6 +729,21 @@ mod tests {
             Err(MetaError::NotFound)
         ));
         engine.lookup(ROOT_INODE, "new").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rename_same_path_is_noop() {
+        let engine = setup().await;
+        let attr = engine
+            .create(ROOT_INODE, "keep", FileType::Regular, 0o644, 0, 0)
+            .await
+            .unwrap();
+        engine
+            .rename(ROOT_INODE, "keep", ROOT_INODE, "keep")
+            .await
+            .unwrap();
+        let after = engine.lookup(ROOT_INODE, "keep").await.unwrap();
+        assert_eq!(after.inode, attr.inode);
     }
 
     #[tokio::test]

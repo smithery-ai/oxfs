@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use opendal::services::{Fs, S3};
 use opendal::Operator;
 
-use oxfs_cache::PassthroughCache;
+use oxfs_vfs::PassthroughCache;
 use oxfs_data::OpenDalDataEngine;
 use oxfs_fuse::OxfsFuse;
 use oxfs_meta::SqliteMetaEngine;

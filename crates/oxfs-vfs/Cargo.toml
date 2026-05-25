@@ -11,4 +11,3 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 oxfs-meta = { workspace = true }
 oxfs-data = { workspace = true }
-oxfs-cache = { workspace = true }

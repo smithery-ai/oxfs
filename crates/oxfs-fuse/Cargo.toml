@@ -11,5 +11,4 @@ bytes = { workspace = true }
 fuser = "0.17"
 oxfs-vfs = { workspace = true }
 oxfs-meta = { workspace = true }
-oxfs-cache = { workspace = true }
 libc = "0.2"
