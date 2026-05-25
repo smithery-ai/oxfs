@@ -1,6 +1,6 @@
 mod cache;
 
-pub use cache::{CacheLayer, PassthroughCache};
+pub use cache::{CacheConfig, CacheLayer, PassthroughCache, TieredCache};
 
 use std::sync::Arc;
 

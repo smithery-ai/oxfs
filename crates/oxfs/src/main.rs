@@ -9,7 +9,7 @@ use opendal::Operator;
 use oxfs_data::OpenDalDataEngine;
 use oxfs_fuse::OxfsFuse;
 use oxfs_meta::{MetaEngine, RedbMetaEngine, SqliteMetaEngine};
-use oxfs_vfs::{PassthroughCache, Vfs};
+use oxfs_vfs::{CacheConfig, TieredCache, Vfs};
 
 #[derive(Parser)]
 #[command(name = "oxfs", about = "FUSE filesystem backed by any object store")]
@@ -38,6 +38,12 @@ enum Command {
         meta_backend: String,
         #[arg(long)]
         default_permissions: bool,
+        #[arg(long, default_value = "256")]
+        cache_mem_mb: u64,
+        #[arg(long)]
+        cache_disk_path: Option<PathBuf>,
+        #[arg(long, default_value = "1024")]
+        cache_disk_mb: u64,
     },
 }
 
@@ -47,9 +53,10 @@ fn mount<M: MetaEngine + 'static>(
     mountpoint: &PathBuf,
     rt: &tokio::runtime::Handle,
     default_permissions: bool,
+    cache_config: CacheConfig,
 ) -> Result<()> {
     let data = OpenDalDataEngine::new(op);
-    let cache = Arc::new(PassthroughCache::new(data));
+    let cache = Arc::new(TieredCache::new(data, cache_config));
     let vfs = Arc::new(Vfs::new(meta, cache));
     let fs = OxfsFuse::new(vfs, rt.clone());
 
@@ -85,6 +92,9 @@ fn main() -> Result<()> {
             meta_db,
             meta_backend,
             default_permissions,
+            cache_mem_mb,
+            cache_disk_path,
+            cache_disk_mb,
         } => {
             let op = match backend.as_str() {
                 "fs" => {
@@ -103,16 +113,30 @@ fn main() -> Result<()> {
                 other => anyhow::bail!("unsupported backend: {other}"),
             };
 
-            tracing::info!("mounting oxfs at {} (meta: {})", mountpoint.display(), meta_backend);
+            let cache_config = CacheConfig {
+                mem_max_bytes: cache_mem_mb * 1024 * 1024,
+                disk_path: cache_disk_path,
+                disk_max_bytes: cache_disk_mb * 1024 * 1024,
+            };
+
+            tracing::info!(
+                "mounting oxfs at {} (meta: {}, cache: {}MB mem{})",
+                mountpoint.display(),
+                meta_backend,
+                cache_mem_mb,
+                cache_config.disk_path.as_ref()
+                    .map(|p| format!(", {}MB disk at {}", cache_disk_mb, p.display()))
+                    .unwrap_or_default(),
+            );
 
             match meta_backend.as_str() {
                 "redb" => {
                     let meta = Arc::new(RedbMetaEngine::new(&meta_db)?);
-                    mount(meta, op, &mountpoint, rt.handle(), default_permissions)?;
+                    mount(meta, op, &mountpoint, rt.handle(), default_permissions, cache_config)?;
                 }
                 "sqlite" => {
                     let meta = Arc::new(SqliteMetaEngine::new(&meta_db)?);
-                    mount(meta, op, &mountpoint, rt.handle(), default_permissions)?;
+                    mount(meta, op, &mountpoint, rt.handle(), default_permissions, cache_config)?;
                 }
                 other => anyhow::bail!("unsupported meta backend: {other} (use redb or sqlite)"),
             }

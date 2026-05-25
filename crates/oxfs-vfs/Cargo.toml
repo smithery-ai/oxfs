@@ -11,3 +11,4 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 oxfs-meta = { workspace = true }
 oxfs-data = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
