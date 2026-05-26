@@ -47,31 +47,29 @@ oxfs uses [Apache OpenDAL](https://github.com/apache/opendal). Any S3-compatible
 
 oxfs has two modes, selectable via `--mode`:
 
-**Flat (default)**: S3 keys map 1:1 to file paths. No local database, no chunking. What you see in the bucket is what you see in the mount. Comparable to GeeseFS and TigrisFS.
+**Flat (default)**: S3 keys map 1:1 to file paths. No local database, no chunking. What you see in the bucket is what you see in the mount. Comparable to GeeseFS and TigrisFS. In write-through mode (default), reads are validated via ETag: a HEAD checks if the cached content is still current, avoiding full GETs when nothing changed.
 
 ```
-FUSE (fuser) -> FlatFuse -> OpenDAL
-                   |
-                stat/dir cache (moka, in-memory)
+FUSE (fuser) -> FlatFuse -> FlatVfs -> CachedOperator -> OpenDAL
+                               |            |
+                         dirty buffers   ETag content cache
+                         flush policy    stat/dir cache (moka)
 ```
 
 **Posix**: local metadata database with tiered caching, write-ahead log, and background compaction. 99.6% pjdfstest compliance (8755/8789 tests, Linux). Supports hard links, device nodes, symlinks, nanosecond timestamps, and other features that flat object storage cannot represent.
 
 ```
-FUSE (fuser) -> VFS -> Cache (moka L1 + disk L2 + WAL) -> Data (OpenDAL)
-                 |
-              Metadata (redb or SQLite)
+FUSE (fuser) -> OxfsFuse -> Vfs -> TieredCache (L1 mem + L2 disk + WAL) -> OpenDAL
+                              |
+                           Metadata (redb or SQLite)
 ```
 
 | Crate | Role |
 |-------|------|
-| oxfs-backend | Storage backend builder (S3, GDrive, Dropbox, local fs via OpenDAL) |
-| oxfs-flat | Flat FUSE impl: direct S3 key-to-path mapping |
-| oxfs-meta | MetaEngine trait, [redb](https://github.com/cberner/redb) and SQLite impls (posix mode) |
-| oxfs-data | [OpenDAL](https://github.com/apache/opendal) wrapper for slice I/O (posix mode) |
-| oxfs-vfs | Inode mgmt, cache, prefetch, compaction (posix mode) |
-| oxfs-fuse | [fuser](https://github.com/cberner/fuser) Filesystem impl (posix mode) |
-| oxfs | CLI binary |
+| oxfs | CLI binary, mode selection |
+| oxfs-flat | Flat mode: `cache.rs` (ETag caching), `vfs.rs` (file semantics), `fuse.rs` (FUSE impl) |
+| oxfs-posix | Posix mode: metadata engines, tiered cache, VFS, prefetch, WAL, FUSE impl |
+| oxfs-backend | Storage backend builder (S3, GDrive, Dropbox, local fs via [OpenDAL](https://github.com/apache/opendal)) |
 
 ## Configuration
 
