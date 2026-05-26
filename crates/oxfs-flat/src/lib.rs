@@ -2,6 +2,7 @@ use std::time::Duration;
 
 pub mod fuse_impl;
 pub mod inode;
+pub mod object_store;
 
 pub use fuse_impl::FlatFuse;
 

@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
+use bytes::Bytes;
 use fuser::{
     Errno, FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use opendal::Operator;
 use parking_lot::RwLock;
 
 use crate::inode::InodeTable;
+use crate::object_store::{FileStat, ObjectStore};
 use crate::FlatConfig;
 
 unsafe extern "C" {
@@ -35,11 +36,9 @@ struct OpenFile {
 }
 
 pub struct FlatFuse {
-    op: Operator,
+    store: ObjectStore,
     rt: tokio::runtime::Handle,
     inodes: InodeTable,
-    dir_cache: moka::future::Cache<String, Vec<(String, bool)>>,
-    stat_cache: moka::future::Cache<String, FileStat>,
     open_files: RwLock<HashMap<u64, OpenFile>>,
     next_fh: AtomicU64,
     uid: u32,
@@ -47,33 +46,19 @@ pub struct FlatFuse {
     writeback: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct FileStat {
-    pub size: u64,
-    pub is_dir: bool,
-    pub last_modified: SystemTime,
-}
-
 impl FlatFuse {
-    pub fn new(op: Operator, rt: tokio::runtime::Handle, config: FlatConfig) -> Self {
-        let dir_cache = moka::future::Cache::builder()
-            .time_to_live(config.dir_ttl)
-            .max_capacity(10_000)
-            .build();
-        let stat_cache = moka::future::Cache::builder()
-            .time_to_live(config.dir_ttl)
-            .max_capacity(100_000)
-            .build();
-
+    pub fn new(
+        op: opendal::Operator,
+        rt: tokio::runtime::Handle,
+        config: FlatConfig,
+    ) -> Self {
         let uid = unsafe { libc_getuid() };
         let gid = unsafe { libc_getgid() };
 
         Self {
-            op,
+            store: ObjectStore::new(op, config.dir_ttl, config.writeback),
             rt,
             inodes: InodeTable::new(),
-            dir_cache,
-            stat_cache,
             open_files: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             uid,
@@ -119,98 +104,17 @@ impl FlatFuse {
         }
     }
 
-    /// Convert the path to an OpenDAL key (directories get trailing slash for list ops).
-    fn dir_key(path: &str) -> String {
-        if path.is_empty() {
-            "/".to_string()
-        } else {
-            format!("{}/", path)
-        }
-    }
-
-    async fn stat_path(&self, path: &str) -> Result<FileStat, Errno> {
-        if path.is_empty() {
-            return Ok(FileStat {
-                size: 0,
-                is_dir: true,
-                last_modified: UNIX_EPOCH,
-            });
-        }
-
-        if let Some(cached) = self.stat_cache.get(path).await {
-            return Ok(cached);
-        }
-
-        // Try as file first
-        match self.op.stat(path).await {
-            Ok(meta) => {
-                let stat = FileStat {
-                    size: meta.content_length(),
-                    is_dir: meta.is_dir(),
-                    last_modified: meta.last_modified()
-                        .map(|t| {
-                            UNIX_EPOCH + Duration::from_secs(t.timestamp() as u64)
-                        })
-                        .unwrap_or(UNIX_EPOCH),
-                };
-                self.stat_cache.insert(path.to_string(), stat.clone()).await;
-                Ok(stat)
-            }
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                // Try as directory (with trailing slash)
-                let dir_path = Self::dir_key(path);
-                match self.op.stat(&dir_path).await {
-                    Ok(meta) => {
-                        let stat = FileStat {
-                            size: 0,
-                            is_dir: true,
-                            last_modified: meta.last_modified()
-                                .map(|t| {
-                                    UNIX_EPOCH + Duration::from_secs(t.timestamp() as u64)
-                                })
-                                .unwrap_or(UNIX_EPOCH),
-                        };
-                        self.stat_cache.insert(path.to_string(), stat.clone()).await;
-                        Ok(stat)
-                    }
-                    Err(e2) if e2.kind() == opendal::ErrorKind::NotFound => {
-                        // Check if it's a "virtual" directory by listing
-                        let entries = self.op.list_with(&dir_path).recursive(false).await;
-                        match entries {
-                            Ok(entries) if !entries.is_empty() => {
-                                let stat = FileStat {
-                                    size: 0,
-                                    is_dir: true,
-                                    last_modified: UNIX_EPOCH,
-                                };
-                                self.stat_cache.insert(path.to_string(), stat.clone()).await;
-                                Ok(stat)
-                            }
-                            _ => Err(Errno::ENOENT),
-                        }
-                    }
-                    Err(_) => Err(Errno::EIO),
-                }
-            }
-            Err(e) if e.kind() == opendal::ErrorKind::PermissionDenied => Err(Errno::EACCES),
-            Err(_) => Err(Errno::EIO),
-        }
-    }
-
     async fn flush_file(&self, fh: u64) -> Result<(), Errno> {
         let (path, data) = {
             let files = self.open_files.read();
             match files.get(&fh) {
-                Some(f) if f.dirty => (f.path.clone(), f.buffer.clone()),
+                Some(f) if f.dirty => (f.path.clone(), Bytes::from(f.buffer.clone())),
                 Some(_) => return Ok(()),
                 None => return Err(Errno::EBADF),
             }
         };
 
-        self.op
-            .write(&path, data)
-            .await
-            .map_err(|_| Errno::EIO)?;
+        self.store.write(&path, data).await.map_err(|_| Errno::EIO)?;
 
         {
             let mut files = self.open_files.write();
@@ -219,10 +123,15 @@ impl FlatFuse {
             }
         }
 
-        // Invalidate stat cache
-        self.stat_cache.remove(&path).await;
-
         Ok(())
+    }
+}
+
+fn to_errno(e: &opendal::Error) -> Errno {
+    match e.kind() {
+        opendal::ErrorKind::NotFound => Errno::ENOENT,
+        opendal::ErrorKind::PermissionDenied => Errno::EACCES,
+        _ => Errno::EIO,
     }
 }
 
@@ -260,13 +169,13 @@ impl Filesystem for FlatFuse {
 
         let path = Self::join_path(&parent_path, name);
 
-        match self.rt.block_on(self.stat_path(&path)) {
+        match self.rt.block_on(self.store.stat(&path)) {
             Ok(stat) => {
                 let ino = self.inodes.allocate(&path);
                 let attr = self.make_file_attr(ino, &stat);
                 reply.entry(&TTL, &attr, fuser::Generation(0));
             }
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(to_errno(&e)),
         }
     }
 
@@ -285,7 +194,6 @@ impl Filesystem for FlatFuse {
             }
         };
 
-        // Check open files for current size
         {
             let files = self.open_files.read();
             for (_, f) in files.iter() {
@@ -303,13 +211,13 @@ impl Filesystem for FlatFuse {
             }
         }
 
-        match self.rt.block_on(self.stat_path(&path)) {
+        match self.rt.block_on(self.store.stat(&path)) {
             Ok(stat) => {
                 let ino_val: u64 = ino.into();
                 let attr = self.make_file_attr(ino_val, &stat);
                 reply.attr(&TTL, &attr);
             }
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(to_errno(&e)),
         }
     }
 
@@ -339,28 +247,16 @@ impl Filesystem for FlatFuse {
             }
         };
 
-        // Handle truncation
         if let Some(new_size) = size {
             let result = self.rt.block_on(async {
                 if new_size == 0 {
-                    self.op.write(&path, Vec::<u8>::new()).await.map_err(|_| Errno::EIO)?;
+                    self.store.write(&path, Vec::<u8>::new()).await.map_err(|_| Errno::EIO)?;
                 } else {
-                    // Read existing, truncate, rewrite
-                    let data = self.op.read(&path).await.map_err(|e| match e.kind() {
-                        opendal::ErrorKind::NotFound => Errno::ENOENT,
-                        _ => Errno::EIO,
-                    })?;
-                    let bytes = data.to_vec();
-                    let truncated = if (new_size as usize) < bytes.len() {
-                        bytes[..new_size as usize].to_vec()
-                    } else {
-                        let mut v = bytes;
-                        v.resize(new_size as usize, 0);
-                        v
-                    };
-                    self.op.write(&path, truncated).await.map_err(|_| Errno::EIO)?;
+                    let data = self.store.read(&path).await.map_err(|e| to_errno(&e))?;
+                    let mut bytes = data.to_vec();
+                    bytes.resize(new_size as usize, 0);
+                    self.store.write(&path, bytes).await.map_err(|_| Errno::EIO)?;
                 }
-                self.stat_cache.remove(&path).await;
                 Ok::<(), Errno>(())
             });
 
@@ -370,14 +266,13 @@ impl Filesystem for FlatFuse {
             }
         }
 
-        // Return updated attrs
-        match self.rt.block_on(self.stat_path(&path)) {
+        match self.rt.block_on(self.store.stat(&path)) {
             Ok(stat) => {
                 let ino_val: u64 = ino.into();
                 let attr = self.make_file_attr(ino_val, &stat);
                 reply.attr(&TTL, &attr);
             }
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(to_errno(&e)),
         }
     }
 
@@ -397,45 +292,16 @@ impl Filesystem for FlatFuse {
             }
         };
 
-        let dir_key = Self::dir_key(&path);
         let ino_val: u64 = ino.into();
 
-        let entries = match self.rt.block_on(async {
-            if let Some(cached) = self.dir_cache.get(&path).await {
-                return Ok(cached);
-            }
-
-            let raw_entries = self.op.list_with(&dir_key).recursive(false).await
-                .map_err(|_| Errno::EIO)?;
-
-            let entries: Vec<(String, bool)> = raw_entries
-                .into_iter()
-                .filter_map(|e| {
-                    let name = e.name().to_string();
-                    // Skip empty names and the directory itself
-                    if name.is_empty() || name == "/" {
-                        return None;
-                    }
-                    let is_dir = name.ends_with('/');
-                    let clean_name = name.trim_end_matches('/').to_string();
-                    if clean_name.is_empty() {
-                        return None;
-                    }
-                    Some((clean_name, is_dir))
-                })
-                .collect();
-
-            self.dir_cache.insert(path.clone(), entries.clone()).await;
-            Ok::<Vec<(String, bool)>, Errno>(entries)
-        }) {
+        let entries = match self.rt.block_on(self.store.list_dir(&path)) {
             Ok(e) => e,
-            Err(e) => {
-                reply.error(e);
+            Err(_) => {
+                reply.error(Errno::EIO);
                 return;
             }
         };
 
-        // Build full entry list with . and ..
         let mut full: Vec<(u64, FuseFileType, String)> = vec![
             (ino_val, FuseFileType::Directory, ".".to_string()),
             (ino_val, FuseFileType::Directory, "..".to_string()),
@@ -498,7 +364,6 @@ impl Filesystem for FlatFuse {
     ) {
         let fh_val: u64 = fh.into();
 
-        // Check if we have a dirty buffer
         {
             let files = self.open_files.read();
             if let Some(f) = files.get(&fh_val).filter(|f| f.dirty) {
@@ -521,9 +386,8 @@ impl Filesystem for FlatFuse {
             }
         };
 
-        match self.rt.block_on(async { self.op.read(&path).await }) {
-            Ok(data) => {
-                let bytes = data.to_vec();
+        match self.rt.block_on(self.store.read(&path)) {
+            Ok(bytes) => {
                 let start = offset as usize;
                 if start >= bytes.len() {
                     reply.data(&[]);
@@ -532,11 +396,11 @@ impl Filesystem for FlatFuse {
                     reply.data(&bytes[start..end]);
                 }
             }
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => reply.error(Errno::ENOENT),
-            Err(e) if e.kind() == opendal::ErrorKind::PermissionDenied => reply.error(Errno::EACCES),
             Err(e) => {
-                tracing::warn!("read {} failed: {:?}", path, e);
-                reply.error(Errno::EIO);
+                if e.kind() != opendal::ErrorKind::NotFound {
+                    tracing::warn!("read {} failed: {:?}", path, e);
+                }
+                reply.error(to_errno(&e));
             }
         }
     }
@@ -563,13 +427,12 @@ impl Filesystem for FlatFuse {
             }
         };
 
-        // If buffer is empty and file exists, read existing content first
         if file.buffer.is_empty() && !file.dirty {
             let path = file.path.clone();
             drop(files);
-            let existing = self.rt.block_on(async {
-                self.op.read(&path).await.ok().map(|d| d.to_vec())
-            });
+            let existing = self
+                .rt
+                .block_on(async { self.store.read(&path).await.ok().map(|d| d.to_vec()) });
             let mut files = self.open_files.write();
             let file = files.get_mut(&fh_val).unwrap();
             if let Some(existing_data) = existing {
@@ -682,8 +545,7 @@ impl Filesystem for FlatFuse {
             dirty: false,
         });
 
-        // Invalidate parent dir cache
-        self.rt.block_on(self.dir_cache.remove(&parent_path));
+        self.rt.block_on(self.store.invalidate_dir(&parent_path));
 
         let stat = FileStat {
             size: 0,
@@ -691,7 +553,13 @@ impl Filesystem for FlatFuse {
             last_modified: SystemTime::now(),
         };
         let attr = self.make_file_attr(ino, &stat);
-        reply.created(&TTL, &attr, fuser::Generation(0), fuser::FileHandle(fh), fuser::FopenFlags::empty());
+        reply.created(
+            &TTL,
+            &attr,
+            fuser::Generation(0),
+            fuser::FileHandle(fh),
+            fuser::FopenFlags::empty(),
+        );
     }
 
     fn unlink(
@@ -720,9 +588,8 @@ impl Filesystem for FlatFuse {
         let path = Self::join_path(&parent_path, name);
 
         match self.rt.block_on(async {
-            self.op.delete(&path).await.map_err(|_| Errno::EIO)?;
-            self.dir_cache.remove(&parent_path).await;
-            self.stat_cache.remove(&path).await;
+            self.store.delete(&path).await.map_err(|_| Errno::EIO)?;
+            self.store.invalidate_dir(&parent_path).await;
             Ok::<(), Errno>(())
         }) {
             Ok(()) => reply.ok(),
@@ -759,8 +626,11 @@ impl Filesystem for FlatFuse {
         let dir_path = format!("{}/", path);
 
         match self.rt.block_on(async {
-            self.op.create_dir(&dir_path).await.map_err(|_| Errno::EIO)?;
-            self.dir_cache.remove(&parent_path).await;
+            self.store
+                .create_dir(&dir_path)
+                .await
+                .map_err(|_| Errno::EIO)?;
+            self.store.invalidate_dir(&parent_path).await;
             Ok::<(), Errno>(())
         }) {
             Ok(()) => {
@@ -804,9 +674,11 @@ impl Filesystem for FlatFuse {
         let dir_path = format!("{}/", path);
 
         match self.rt.block_on(async {
-            self.op.delete(&dir_path).await.map_err(|_| Errno::EIO)?;
-            self.dir_cache.remove(&parent_path).await;
-            self.stat_cache.remove(&path).await;
+            self.store
+                .delete(&dir_path)
+                .await
+                .map_err(|_| Errno::EIO)?;
+            self.store.invalidate_dir(&parent_path).await;
             Ok::<(), Errno>(())
         }) {
             Ok(()) => reply.ok(),
@@ -858,12 +730,16 @@ impl Filesystem for FlatFuse {
         let dst_path = Self::join_path(&dst_parent_path, dst_name);
 
         match self.rt.block_on(async {
-            self.op.copy(&src_path, &dst_path).await.map_err(|_| Errno::EIO)?;
-            self.op.delete(&src_path).await.map_err(|_| Errno::EIO)?;
-            self.dir_cache.remove(&src_parent_path).await;
-            self.dir_cache.remove(&dst_parent_path).await;
-            self.stat_cache.remove(&src_path).await;
-            self.stat_cache.remove(&dst_path).await;
+            self.store
+                .copy(&src_path, &dst_path)
+                .await
+                .map_err(|_| Errno::EIO)?;
+            self.store
+                .delete(&src_path)
+                .await
+                .map_err(|_| Errno::EIO)?;
+            self.store.invalidate_dir(&src_parent_path).await;
+            self.store.invalidate_dir(&dst_parent_path).await;
             Ok::<(), Errno>(())
         }) {
             Ok(()) => reply.ok(),
@@ -873,14 +749,14 @@ impl Filesystem for FlatFuse {
 
     fn statfs(&self, _req: &Request, _ino: fuser::INodeNo, reply: ReplyStatfs) {
         reply.statfs(
-            1_000_000_000, // blocks
-            500_000_000,   // bfree
-            500_000_000,   // bavail
-            1_000_000,     // files
-            500_000,       // ffree
-            4096,          // bsize
-            255,           // namelen
-            0,             // frsize
+            1_000_000_000,
+            500_000_000,
+            500_000_000,
+            1_000_000,
+            500_000,
+            4096,
+            255,
+            0,
         );
     }
 
