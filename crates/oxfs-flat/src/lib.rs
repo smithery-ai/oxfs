@@ -1,10 +1,11 @@
 use std::time::Duration;
 
-pub mod cached_op;
-pub mod fuse_impl;
+pub mod cache;
+pub mod fuse;
 pub mod inode;
+pub mod vfs;
 
-pub use fuse_impl::FlatFuse;
+pub use fuse::FlatFuse;
 
 /// Configuration for the flat FUSE filesystem.
 pub struct FlatConfig {
