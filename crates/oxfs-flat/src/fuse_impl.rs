@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use fuser::{
@@ -10,8 +10,8 @@ use fuser::{
 };
 use parking_lot::RwLock;
 
+use crate::cached_op::CachedOperator;
 use crate::inode::InodeTable;
-use crate::object_store::{FileStat, ObjectStore};
 use crate::FlatConfig;
 
 unsafe extern "C" {
@@ -35,8 +35,15 @@ struct OpenFile {
     dirty: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct FileStat {
+    pub size: u64,
+    pub is_dir: bool,
+    pub last_modified: SystemTime,
+}
+
 pub struct FlatFuse {
-    store: ObjectStore,
+    op: CachedOperator,
     rt: tokio::runtime::Handle,
     inodes: InodeTable,
     open_files: RwLock<HashMap<u64, OpenFile>>,
@@ -48,7 +55,7 @@ pub struct FlatFuse {
 
 impl FlatFuse {
     pub fn new(
-        op: opendal::Operator,
+        operator: opendal::Operator,
         rt: tokio::runtime::Handle,
         config: FlatConfig,
     ) -> Self {
@@ -56,7 +63,7 @@ impl FlatFuse {
         let gid = unsafe { libc_getgid() };
 
         Self {
-            store: ObjectStore::new(op, config.dir_ttl, config.writeback),
+            op: CachedOperator::new(operator, config.dir_ttl, config.writeback),
             rt,
             inodes: InodeTable::new(),
             open_files: RwLock::new(HashMap::new()),
@@ -104,6 +111,68 @@ impl FlatFuse {
         }
     }
 
+    fn dir_key(path: &str) -> String {
+        if path.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{}/", path)
+        }
+    }
+
+    fn meta_to_stat(meta: &opendal::Metadata) -> FileStat {
+        FileStat {
+            size: meta.content_length(),
+            is_dir: meta.is_dir(),
+            last_modified: meta
+                .last_modified()
+                .map(|t| UNIX_EPOCH + Duration::from_secs(t.timestamp() as u64))
+                .unwrap_or(UNIX_EPOCH),
+        }
+    }
+
+    /// Resolve a path to a FileStat, trying file, then directory, then
+    /// virtual directory (S3 prefix with children but no explicit key).
+    async fn stat_path(&self, path: &str) -> Result<FileStat, Errno> {
+        if path.is_empty() {
+            return Ok(FileStat {
+                size: 0,
+                is_dir: true,
+                last_modified: UNIX_EPOCH,
+            });
+        }
+
+        match self.op.stat(path).await {
+            Ok(meta) => Ok(Self::meta_to_stat(&meta)),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                let dir_path = Self::dir_key(path);
+                match self.op.stat(&dir_path).await {
+                    Ok(meta) => Ok(FileStat {
+                        size: 0,
+                        is_dir: true,
+                        last_modified: meta
+                            .last_modified()
+                            .map(|t| UNIX_EPOCH + Duration::from_secs(t.timestamp() as u64))
+                            .unwrap_or(UNIX_EPOCH),
+                    }),
+                    Err(e2) if e2.kind() == opendal::ErrorKind::NotFound => {
+                        let entries = self.op.list(path).await;
+                        match entries {
+                            Ok(entries) if !entries.is_empty() => Ok(FileStat {
+                                size: 0,
+                                is_dir: true,
+                                last_modified: UNIX_EPOCH,
+                            }),
+                            _ => Err(Errno::ENOENT),
+                        }
+                    }
+                    Err(_) => Err(Errno::EIO),
+                }
+            }
+            Err(e) if e.kind() == opendal::ErrorKind::PermissionDenied => Err(Errno::EACCES),
+            Err(_) => Err(Errno::EIO),
+        }
+    }
+
     async fn flush_file(&self, fh: u64) -> Result<(), Errno> {
         let (path, data) = {
             let files = self.open_files.read();
@@ -114,7 +183,7 @@ impl FlatFuse {
             }
         };
 
-        self.store.write(&path, data).await.map_err(|_| Errno::EIO)?;
+        self.op.write(&path, data).await.map_err(|_| Errno::EIO)?;
 
         {
             let mut files = self.open_files.write();
@@ -169,13 +238,13 @@ impl Filesystem for FlatFuse {
 
         let path = Self::join_path(&parent_path, name);
 
-        match self.rt.block_on(self.store.stat(&path)) {
+        match self.rt.block_on(self.stat_path(&path)) {
             Ok(stat) => {
                 let ino = self.inodes.allocate(&path);
                 let attr = self.make_file_attr(ino, &stat);
                 reply.entry(&TTL, &attr, fuser::Generation(0));
             }
-            Err(e) => reply.error(to_errno(&e)),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -211,13 +280,13 @@ impl Filesystem for FlatFuse {
             }
         }
 
-        match self.rt.block_on(self.store.stat(&path)) {
+        match self.rt.block_on(self.stat_path(&path)) {
             Ok(stat) => {
                 let ino_val: u64 = ino.into();
                 let attr = self.make_file_attr(ino_val, &stat);
                 reply.attr(&TTL, &attr);
             }
-            Err(e) => reply.error(to_errno(&e)),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -250,12 +319,15 @@ impl Filesystem for FlatFuse {
         if let Some(new_size) = size {
             let result = self.rt.block_on(async {
                 if new_size == 0 {
-                    self.store.write(&path, Vec::<u8>::new()).await.map_err(|_| Errno::EIO)?;
+                    self.op
+                        .write(&path, Vec::<u8>::new())
+                        .await
+                        .map_err(|_| Errno::EIO)?;
                 } else {
-                    let data = self.store.read(&path).await.map_err(|e| to_errno(&e))?;
+                    let data = self.op.read(&path).await.map_err(|e| to_errno(&e))?;
                     let mut bytes = data.to_vec();
                     bytes.resize(new_size as usize, 0);
-                    self.store.write(&path, bytes).await.map_err(|_| Errno::EIO)?;
+                    self.op.write(&path, bytes).await.map_err(|_| Errno::EIO)?;
                 }
                 Ok::<(), Errno>(())
             });
@@ -266,13 +338,13 @@ impl Filesystem for FlatFuse {
             }
         }
 
-        match self.rt.block_on(self.store.stat(&path)) {
+        match self.rt.block_on(self.stat_path(&path)) {
             Ok(stat) => {
                 let ino_val: u64 = ino.into();
                 let attr = self.make_file_attr(ino_val, &stat);
                 reply.attr(&TTL, &attr);
             }
-            Err(e) => reply.error(to_errno(&e)),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -294,7 +366,7 @@ impl Filesystem for FlatFuse {
 
         let ino_val: u64 = ino.into();
 
-        let entries = match self.rt.block_on(self.store.list_dir(&path)) {
+        let entries = match self.rt.block_on(self.op.list(&path)) {
             Ok(e) => e,
             Err(_) => {
                 reply.error(Errno::EIO);
@@ -342,11 +414,14 @@ impl Filesystem for FlatFuse {
         };
 
         let fh = self.alloc_fh();
-        self.open_files.write().insert(fh, OpenFile {
-            path,
-            buffer: Vec::new(),
-            dirty: false,
-        });
+        self.open_files.write().insert(
+            fh,
+            OpenFile {
+                path,
+                buffer: Vec::new(),
+                dirty: false,
+            },
+        );
 
         reply.opened(fuser::FileHandle(fh), fuser::FopenFlags::empty());
     }
@@ -386,7 +461,7 @@ impl Filesystem for FlatFuse {
             }
         };
 
-        match self.rt.block_on(self.store.read(&path)) {
+        match self.rt.block_on(self.op.read(&path)) {
             Ok(bytes) => {
                 let start = offset as usize;
                 if start >= bytes.len() {
@@ -432,7 +507,7 @@ impl Filesystem for FlatFuse {
             drop(files);
             let existing = self
                 .rt
-                .block_on(async { self.store.read(&path).await.ok().map(|d| d.to_vec()) });
+                .block_on(async { self.op.read(&path).await.ok().map(|d| d.to_vec()) });
             let mut files = self.open_files.write();
             let file = files.get_mut(&fh_val).unwrap();
             if let Some(existing_data) = existing {
@@ -539,13 +614,16 @@ impl Filesystem for FlatFuse {
         let ino = self.inodes.allocate(&path);
         let fh = self.alloc_fh();
 
-        self.open_files.write().insert(fh, OpenFile {
-            path: path.clone(),
-            buffer: Vec::new(),
-            dirty: false,
-        });
+        self.open_files.write().insert(
+            fh,
+            OpenFile {
+                path: path.clone(),
+                buffer: Vec::new(),
+                dirty: false,
+            },
+        );
 
-        self.rt.block_on(self.store.invalidate_dir(&parent_path));
+        self.rt.block_on(self.op.invalidate_dir(&parent_path));
 
         let stat = FileStat {
             size: 0,
@@ -588,8 +666,8 @@ impl Filesystem for FlatFuse {
         let path = Self::join_path(&parent_path, name);
 
         match self.rt.block_on(async {
-            self.store.delete(&path).await.map_err(|_| Errno::EIO)?;
-            self.store.invalidate_dir(&parent_path).await;
+            self.op.delete(&path).await.map_err(|_| Errno::EIO)?;
+            self.op.invalidate_dir(&parent_path).await;
             Ok::<(), Errno>(())
         }) {
             Ok(()) => reply.ok(),
@@ -626,11 +704,11 @@ impl Filesystem for FlatFuse {
         let dir_path = format!("{}/", path);
 
         match self.rt.block_on(async {
-            self.store
+            self.op
                 .create_dir(&dir_path)
                 .await
                 .map_err(|_| Errno::EIO)?;
-            self.store.invalidate_dir(&parent_path).await;
+            self.op.invalidate_dir(&parent_path).await;
             Ok::<(), Errno>(())
         }) {
             Ok(()) => {
@@ -674,11 +752,11 @@ impl Filesystem for FlatFuse {
         let dir_path = format!("{}/", path);
 
         match self.rt.block_on(async {
-            self.store
+            self.op
                 .delete(&dir_path)
                 .await
                 .map_err(|_| Errno::EIO)?;
-            self.store.invalidate_dir(&parent_path).await;
+            self.op.invalidate_dir(&parent_path).await;
             Ok::<(), Errno>(())
         }) {
             Ok(()) => reply.ok(),
@@ -730,16 +808,16 @@ impl Filesystem for FlatFuse {
         let dst_path = Self::join_path(&dst_parent_path, dst_name);
 
         match self.rt.block_on(async {
-            self.store
+            self.op
                 .copy(&src_path, &dst_path)
                 .await
                 .map_err(|_| Errno::EIO)?;
-            self.store
+            self.op
                 .delete(&src_path)
                 .await
                 .map_err(|_| Errno::EIO)?;
-            self.store.invalidate_dir(&src_parent_path).await;
-            self.store.invalidate_dir(&dst_parent_path).await;
+            self.op.invalidate_dir(&src_parent_path).await;
+            self.op.invalidate_dir(&dst_parent_path).await;
             Ok::<(), Errno>(())
         }) {
             Ok(()) => reply.ok(),

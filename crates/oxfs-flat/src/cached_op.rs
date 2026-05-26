@@ -1,14 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bytes::Bytes;
 use opendal::Operator;
-
-#[derive(Clone, Debug)]
-pub struct FileStat {
-    pub size: u64,
-    pub is_dir: bool,
-    pub last_modified: SystemTime,
-}
 
 #[derive(Clone)]
 struct CachedContent {
@@ -16,15 +9,21 @@ struct CachedContent {
     etag: String,
 }
 
-pub struct ObjectStore {
+/// Caching wrapper around an OpenDAL operator.
+///
+/// Provides ETag-validated content caching (write-through mode),
+/// TTL-based stat and directory caches, and automatic invalidation
+/// on writes. No filesystem semantics: callers handle path
+/// resolution, dirty buffers, and flush policy.
+pub struct CachedOperator {
     op: Operator,
     dir_cache: moka::future::Cache<String, Vec<(String, bool)>>,
-    stat_cache: moka::future::Cache<String, FileStat>,
+    stat_cache: moka::future::Cache<String, opendal::Metadata>,
     content_cache: moka::future::Cache<String, CachedContent>,
     writeback: bool,
 }
 
-impl ObjectStore {
+impl CachedOperator {
     pub fn new(op: Operator, dir_ttl: Duration, writeback: bool) -> Self {
         let dir_cache = moka::future::Cache::builder()
             .time_to_live(dir_ttl)
@@ -50,63 +49,16 @@ impl ObjectStore {
         }
     }
 
-    pub async fn stat(&self, path: &str) -> Result<FileStat, opendal::Error> {
-        if path.is_empty() {
-            return Ok(FileStat {
-                size: 0,
-                is_dir: true,
-                last_modified: UNIX_EPOCH,
-            });
-        }
-
+    pub async fn stat(&self, path: &str) -> Result<opendal::Metadata, opendal::Error> {
         if let Some(cached) = self.stat_cache.get(path).await {
             return Ok(cached);
         }
 
-        match self.op.stat(path).await {
-            Ok(meta) => {
-                let stat = Self::meta_to_stat(&meta);
-                self.stat_cache.insert(path.to_string(), stat.clone()).await;
-                Ok(stat)
-            }
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                let dir_path = Self::dir_key(path);
-                match self.op.stat(&dir_path).await {
-                    Ok(meta) => {
-                        let stat = FileStat {
-                            size: 0,
-                            is_dir: true,
-                            last_modified: meta
-                                .last_modified()
-                                .map(|t| UNIX_EPOCH + Duration::from_secs(t.timestamp() as u64))
-                                .unwrap_or(UNIX_EPOCH),
-                        };
-                        self.stat_cache.insert(path.to_string(), stat.clone()).await;
-                        Ok(stat)
-                    }
-                    Err(e2) if e2.kind() == opendal::ErrorKind::NotFound => {
-                        let entries = self.op.list_with(&dir_path).recursive(false).await;
-                        match entries {
-                            Ok(entries) if !entries.is_empty() => {
-                                let stat = FileStat {
-                                    size: 0,
-                                    is_dir: true,
-                                    last_modified: UNIX_EPOCH,
-                                };
-                                self.stat_cache.insert(path.to_string(), stat.clone()).await;
-                                Ok(stat)
-                            }
-                            _ => Err(opendal::Error::new(
-                                opendal::ErrorKind::NotFound,
-                                "not found",
-                            )),
-                        }
-                    }
-                    Err(e2) => Err(e2),
-                }
-            }
-            Err(e) => Err(e),
-        }
+        let meta = self.op.stat(path).await?;
+        self.stat_cache
+            .insert(path.to_string(), meta.clone())
+            .await;
+        Ok(meta)
     }
 
     pub async fn read(&self, path: &str) -> Result<Bytes, opendal::Error> {
@@ -159,7 +111,11 @@ impl ObjectStore {
         self.op.read(path).await.map(|d| d.to_bytes())
     }
 
-    pub async fn write(&self, path: &str, data: impl Into<opendal::Buffer>) -> Result<(), opendal::Error> {
+    pub async fn write(
+        &self,
+        path: &str,
+        data: impl Into<opendal::Buffer>,
+    ) -> Result<(), opendal::Error> {
         self.op.write(path, data).await?;
         self.invalidate(path).await;
         Ok(())
@@ -179,16 +135,19 @@ impl ObjectStore {
     }
 
     pub async fn create_dir(&self, path: &str) -> Result<(), opendal::Error> {
-        self.op.create_dir(path).await?;
-        Ok(())
+        self.op.create_dir(path).await
     }
 
-    pub async fn list_dir(&self, path: &str) -> Result<Vec<(String, bool)>, opendal::Error> {
+    pub async fn list(&self, path: &str) -> Result<Vec<(String, bool)>, opendal::Error> {
         if let Some(cached) = self.dir_cache.get(path).await {
             return Ok(cached);
         }
 
-        let dir_key = Self::dir_key(path);
+        let dir_key = if path.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{}/", path)
+        };
         let raw_entries = self.op.list_with(&dir_key).recursive(false).await?;
 
         let entries: Vec<(String, bool)> = raw_entries
@@ -207,7 +166,9 @@ impl ObjectStore {
             })
             .collect();
 
-        self.dir_cache.insert(path.to_string(), entries.clone()).await;
+        self.dir_cache
+            .insert(path.to_string(), entries.clone())
+            .await;
         Ok(entries)
     }
 
@@ -218,24 +179,5 @@ impl ObjectStore {
 
     pub async fn invalidate_dir(&self, path: &str) {
         self.dir_cache.remove(path).await;
-    }
-
-    fn dir_key(path: &str) -> String {
-        if path.is_empty() {
-            "/".to_string()
-        } else {
-            format!("{}/", path)
-        }
-    }
-
-    fn meta_to_stat(meta: &opendal::Metadata) -> FileStat {
-        FileStat {
-            size: meta.content_length(),
-            is_dir: meta.is_dir(),
-            last_modified: meta
-                .last_modified()
-                .map(|t| UNIX_EPOCH + Duration::from_secs(t.timestamp() as u64))
-                .unwrap_or(UNIX_EPOCH),
-        }
     }
 }
