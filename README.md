@@ -101,25 +101,6 @@ oxfs mount <mountpoint>
   --wal-path <path>                 Write-ahead log (crash recovery)
 ```
 
-## Benchmarks
-
-Flat mode vs GeeseFS and TigrisFS against Cloudflare R2 (median of 3 runs, Linux aarch64 in Docker):
-
-| Metric | oxfs | geesefs | tigrisfs |
-|--------|------|---------|----------|
-| single file roundtrip | 3578ms | **8ms** | - |
-| create 10 files | 22557ms | **903ms** | - |
-| read 10 files | 5673ms | **16ms** | - |
-| write 256KB | 3271ms | **11ms** | - |
-| stat 10 files | 2718ms | **15ms** | - |
-| mkdir+rmdir 5 dirs | 11687ms | **16ms** | - |
-| rename 5 files | 30443ms | **20ms** | - |
-| symlink roundtrip | 7572ms | **12ms** | - |
-
-oxfs flat mode currently does synchronous S3 calls on most FUSE operations. GeeseFS uses aggressive write-back buffering and in-memory caching. Performance optimization (longer cache TTLs, write-back buffering, negative caching) is in progress.
-
-Reproduce: `docker build -f bench/Dockerfile -t oxfs-bench . && docker run --rm --privileged -e R2_ACCOUNT_ID=... -e R2_ACCESS_KEY_ID=... -e R2_SECRET_ACCESS_KEY=... oxfs-bench`
-
 ## License
 
 MIT OR Apache-2.0
