@@ -4,9 +4,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use opendal::services::{Fs, S3};
-use opendal::Operator;
 
+use oxfs_backend::{BackendConfig, Operator, build_operator};
 use oxfs_data::OpenDalDataEngine;
 use oxfs_flat::{FlatConfig, FlatFuse};
 use oxfs_fuse::OxfsFuse;
@@ -36,6 +35,14 @@ enum Command {
         endpoint: Option<String>,
         #[arg(long)]
         prefix: Option<String>,
+        #[arg(long, env = "OXFS_ACCESS_TOKEN")]
+        access_token: Option<String>,
+        #[arg(long, env = "OXFS_REFRESH_TOKEN")]
+        refresh_token: Option<String>,
+        #[arg(long, env = "OXFS_CLIENT_ID")]
+        client_id: Option<String>,
+        #[arg(long, env = "OXFS_CLIENT_SECRET")]
+        client_secret: Option<String>,
         #[arg(long, default_value = "oxfs.db")]
         meta_db: PathBuf,
         #[arg(long, default_value = "redb")]
@@ -50,17 +57,17 @@ enum Command {
         cache_disk_mb: u64,
         #[arg(long)]
         wal_path: Option<PathBuf>,
-        /// Fork into the background before mounting.
         #[arg(short = 'd', long)]
         daemonize: bool,
-        /// Filesystem mode: "posix" (default) uses meta engine + cache layers;
-        /// "flat" maps S3 keys directly to file paths with no local metadata.
         #[arg(long, default_value = "flat")]
         mode: String,
+        /// Buffer writes and flush on close (faster, requires readers use the mount)
+        #[arg(long)]
+        writeback: bool,
     },
 }
 
-fn mount<M: MetaEngine + 'static>(
+fn mount_posix<M: MetaEngine + 'static>(
     meta: Arc<M>,
     op: Operator,
     mountpoint: &PathBuf,
@@ -103,6 +110,10 @@ fn main() -> Result<()> {
             region,
             endpoint,
             prefix,
+            access_token,
+            refresh_token,
+            client_id,
+            client_secret,
             meta_db,
             meta_backend,
             default_permissions,
@@ -112,30 +123,27 @@ fn main() -> Result<()> {
             wal_path,
             daemonize,
             mode,
+            writeback,
         } => {
-            let op = match backend.as_str() {
-                "fs" => {
-                    let root = root.unwrap_or_else(|| PathBuf::from("/tmp/oxfs-data"));
-                    std::fs::create_dir_all(&root)?;
-                    let builder = Fs::default().root(root.to_str().unwrap());
-                    Operator::new(builder)?.finish()
-                }
-                "s3" => {
-                    let mut builder = S3::default();
-                    if let Some(ref b) = bucket { builder = builder.bucket(b); }
-                    if let Some(ref r) = region { builder = builder.region(r); }
-                    if let Some(ref e) = endpoint { builder = builder.endpoint(e); }
-                    if let Some(ref p) = prefix { builder = builder.root(p); }
-                    Operator::new(builder)?.finish()
-                }
-                other => anyhow::bail!("unsupported backend: {other}"),
-            };
+            let op = build_operator(&backend, BackendConfig {
+                root,
+                bucket,
+                region,
+                endpoint,
+                prefix,
+                access_token,
+                refresh_token,
+                client_id,
+                client_secret,
+            })?;
+
+            if daemonize {
+                let daemon = daemonize::Daemonize::new().working_directory("/");
+                daemon.start()?;
+            }
 
             if mode == "flat" {
-                tracing::info!(
-                    "mounting oxfs (flat mode) at {}",
-                    mountpoint.display(),
-                );
+                tracing::info!("mounting oxfs (flat mode) at {}", mountpoint.display());
 
                 let rt = tokio::runtime::Runtime::new()?;
                 let _guard = rt.enter();
@@ -143,16 +151,8 @@ fn main() -> Result<()> {
                 let flat_fuse = FlatFuse::new(
                     op,
                     rt.handle().clone(),
-                    FlatConfig {
-                        dir_ttl: Duration::from_secs(1),
-                    },
+                    FlatConfig { dir_ttl: Duration::from_secs(1), writeback },
                 );
-
-                if daemonize {
-                    let daemon = daemonize::Daemonize::new()
-                        .working_directory("/");
-                    daemon.start()?;
-                }
 
                 let mut config = fuser::Config::default();
                 config.mount_options.push(fuser::MountOption::FSName("oxfs".into()));
@@ -179,20 +179,14 @@ fn main() -> Result<()> {
                         .unwrap_or_default(),
                 );
 
-                if daemonize {
-                    let daemon = daemonize::Daemonize::new()
-                        .working_directory("/");
-                    daemon.start()?;
-                }
-
                 match meta_backend.as_str() {
                     "redb" => {
                         let meta = Arc::new(RedbMetaEngine::new(&meta_db)?);
-                        mount(meta, op, &mountpoint, default_permissions, cache_config)?;
+                        mount_posix(meta, op, &mountpoint, default_permissions, cache_config)?;
                     }
                     "sqlite" => {
                         let meta = Arc::new(SqliteMetaEngine::new(&meta_db)?);
-                        mount(meta, op, &mountpoint, default_permissions, cache_config)?;
+                        mount_posix(meta, op, &mountpoint, default_permissions, cache_config)?;
                     }
                     other => anyhow::bail!("unsupported meta backend: {other} (use redb or sqlite)"),
                 }
