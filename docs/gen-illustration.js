@@ -76,7 +76,7 @@ const icons = {
 // ─── Tile definitions ────────────────────────────────────────
 const leftDefs = [
   { icon: 'oci' },
-  { png: 'fc-icon-sm.png' },
+  { pngFile: 'docs/fc-icon-sm.png' },
 ]
 
 const rightDefs = [
@@ -160,10 +160,12 @@ leftTiles.forEach((t, i) => {
   push(tile(t.x, t.y, TILE, TILE, 'tile'))
   if (def.icon) {
     push(iconG(t.x, t.y, def.icon))
-  } else if (def.png) {
+  } else if (def.pngFile) {
+    const fs = require('fs')
+    const b64 = fs.readFileSync(def.pngFile).toString('base64')
     const imgPad = TILE * 0.15
     const imgSize = TILE - imgPad * 2
-    push(`  <image href="${def.png}" x="${t.x + imgPad}" y="${t.y + imgPad}" width="${imgSize}" height="${imgSize}"/>`)
+    push(`  <image href="data:image/png;base64,${b64}" x="${t.x + imgPad}" y="${t.y + imgPad}" width="${imgSize}" height="${imgSize}"/>`)
   }
 })
 
