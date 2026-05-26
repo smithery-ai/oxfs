@@ -6,11 +6,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use oxfs_backend::{BackendConfig, Operator, build_operator};
-use oxfs_data::OpenDalDataEngine;
 use oxfs_flat::{FlatConfig, FlatFuse};
-use oxfs_fuse::OxfsFuse;
-use oxfs_meta::{MetaEngine, RedbMetaEngine, SqliteMetaEngine};
-use oxfs_vfs::{CacheConfig, TieredCache, Vfs};
+use oxfs_posix::{
+    CacheConfig, MetaEngine, OxfsFuse, OpenDalDataEngine,
+    RedbMetaEngine, SqliteMetaEngine, TieredCache, Vfs,
+};
 
 #[derive(Parser)]
 #[command(name = "oxfs", about = "FUSE filesystem backed by any object store")]

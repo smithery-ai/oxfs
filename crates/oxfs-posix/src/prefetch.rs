@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use crate::cache::CacheLayer;
-use oxfs_meta::MetaEngine;
+use crate::MetaEngine;
 
 pub struct Prefetcher {
     state: Mutex<HashMap<u64, PrefetchState>>,

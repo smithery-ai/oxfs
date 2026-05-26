@@ -7,9 +7,9 @@ use fuser::{
     Errno, FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use oxfs_vfs::CacheLayer;
-use oxfs_meta::{FileType, MetaEngine, SetAttrRequest};
-use oxfs_vfs::Vfs;
+use crate::cache::CacheLayer;
+use crate::{FileType, MetaEngine, SetAttrRequest};
+use crate::vfs::Vfs;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -36,7 +36,7 @@ fn to_fuse_file_type(ft: FileType) -> FuseFileType {
     }
 }
 
-fn to_file_attr(attr: &oxfs_meta::InodeAttr) -> FileAttr {
+fn to_file_attr(attr: &crate::InodeAttr) -> FileAttr {
     FileAttr {
         ino: fuser::INodeNo(attr.inode),
         size: attr.size,
@@ -56,17 +56,17 @@ fn to_file_attr(attr: &oxfs_meta::InodeAttr) -> FileAttr {
     }
 }
 
-fn vfs_err_to_errno(e: &oxfs_vfs::VfsError) -> Errno {
+fn vfs_err_to_errno(e: &crate::vfs::VfsError) -> Errno {
     match e {
-        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::NotFound) => Errno::ENOENT,
-        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::AlreadyExists) => Errno::EEXIST,
-        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::NotDirectory) => Errno::ENOTDIR,
-        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::NotEmpty) => Errno::ENOTEMPTY,
-        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::IsDirectory) => Errno::EISDIR,
-        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::PermissionDenied) => Errno::EPERM,
-        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::NotSupported) => Errno::ENOSYS,
-        oxfs_vfs::VfsError::Meta(oxfs_meta::MetaError::NameTooLong) => Errno::ENAMETOOLONG,
-        oxfs_vfs::VfsError::Invalid(_) => Errno::EINVAL,
+        crate::vfs::VfsError::Meta(crate::MetaError::NotFound) => Errno::ENOENT,
+        crate::vfs::VfsError::Meta(crate::MetaError::AlreadyExists) => Errno::EEXIST,
+        crate::vfs::VfsError::Meta(crate::MetaError::NotDirectory) => Errno::ENOTDIR,
+        crate::vfs::VfsError::Meta(crate::MetaError::NotEmpty) => Errno::ENOTEMPTY,
+        crate::vfs::VfsError::Meta(crate::MetaError::IsDirectory) => Errno::EISDIR,
+        crate::vfs::VfsError::Meta(crate::MetaError::PermissionDenied) => Errno::EPERM,
+        crate::vfs::VfsError::Meta(crate::MetaError::NotSupported) => Errno::ENOSYS,
+        crate::vfs::VfsError::Meta(crate::MetaError::NameTooLong) => Errno::ENAMETOOLONG,
+        crate::vfs::VfsError::Invalid(_) => Errno::EINVAL,
         _ => Errno::EIO,
     }
 }
