@@ -1,24 +1,18 @@
-mod cache;
-mod prefetch;
-pub mod wal;
-
-pub use cache::{CacheConfig, CacheLayer, PassthroughCache, TieredCache};
-pub use prefetch::Prefetcher;
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use oxfs_meta::{
-    DirEntry, FileType, InodeAttr, MetaEngine, SetAttrRequest, Slice, StatFs, CHUNK_SIZE,
-};
+use crate::cache::CacheLayer;
+use crate::meta::{MetaEngine, SetAttrRequest, StatFs};
+use crate::prefetch::{self, Prefetcher};
+use crate::types::{DirEntry, FileType, InodeAttr, Slice, CHUNK_SIZE};
 
 #[derive(Debug, thiserror::Error)]
 pub enum VfsError {
     #[error("meta: {0}")]
-    Meta(#[from] oxfs_meta::MetaError),
+    Meta(#[from] crate::MetaError),
     #[error("data: {0}")]
-    Data(#[from] oxfs_data::DataError),
+    Data(#[from] crate::data::DataError),
     #[error("invalid argument: {0}")]
     Invalid(String),
 }

@@ -1,5 +1,5 @@
 [package]
-name = "oxfs-meta"
+name = "oxfs-posix"
 version.workspace = true
 edition.workspace = true
 
@@ -9,10 +9,16 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+opendal = { version = "0.51", features = ["services-fs", "services-s3"] }
+fuser = "0.17"
+moka = { version = "0.12", features = ["future"] }
+parking_lot = "0.12"
+futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 redb = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

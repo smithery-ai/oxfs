@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use moka::future::Cache;
-use oxfs_data::{DataEngine, DataResult};
+use crate::data::{DataEngine, DataResult};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 

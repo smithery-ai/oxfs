@@ -1,11 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/oxfs-meta",
-    "crates/oxfs-data",
-    "crates/oxfs-vfs",
-    "crates/oxfs-fuse",
     "crates/oxfs-flat",
+    "crates/oxfs-posix",
     "crates/oxfs-backend",
     "crates/oxfs",
 ]
@@ -24,9 +21,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 
-oxfs-meta = { path = "crates/oxfs-meta" }
-oxfs-data = { path = "crates/oxfs-data" }
-oxfs-vfs = { path = "crates/oxfs-vfs" }
-oxfs-fuse = { path = "crates/oxfs-fuse" }
 oxfs-flat = { path = "crates/oxfs-flat" }
+oxfs-posix = { path = "crates/oxfs-posix" }
 oxfs-backend = { path = "crates/oxfs-backend" }

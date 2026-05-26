@@ -13,11 +13,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
-oxfs-meta = { workspace = true }
-oxfs-data = { workspace = true }
-oxfs-vfs = { workspace = true }
-oxfs-fuse = { workspace = true }
 oxfs-flat = { workspace = true }
+oxfs-posix = { workspace = true }
 oxfs-backend = { workspace = true }
 fuser = "0.17"
 daemonize = "0.5"
