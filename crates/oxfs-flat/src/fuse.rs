@@ -299,6 +299,12 @@ impl Filesystem for FlatFuse {
         };
 
         let path = Self::join_path(&parent_path, name);
+
+        if let Err(e) = self.rt.block_on(self.vfs.create_empty(&path)) {
+            reply.error(to_errno(e));
+            return;
+        }
+
         let ino = self.inodes.allocate(&path);
         let fh = self.vfs.open(path);
 

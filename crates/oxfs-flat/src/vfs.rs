@@ -11,6 +11,7 @@ struct OpenFile {
     path: String,
     buffer: Vec<u8>,
     dirty: bool,
+    flush_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -33,6 +34,14 @@ pub struct FlatVfs {
     open_files: RwLock<HashMap<u64, OpenFile>>,
     next_fh: AtomicU64,
     writeback: bool,
+}
+
+fn opendal_to_vfs(e: opendal::Error) -> VfsError {
+    match e.kind() {
+        opendal::ErrorKind::NotFound => VfsError::NotFound,
+        opendal::ErrorKind::PermissionDenied => VfsError::PermissionDenied,
+        _ => VfsError::Io,
+    }
 }
 
 impl FlatVfs {
@@ -128,11 +137,7 @@ impl FlatVfs {
     }
 
     pub async fn read(&self, path: &str) -> Result<Bytes, VfsError> {
-        self.op.read(path).await.map_err(|e| match e.kind() {
-            opendal::ErrorKind::NotFound => VfsError::NotFound,
-            opendal::ErrorKind::PermissionDenied => VfsError::PermissionDenied,
-            _ => VfsError::Io,
-        })
+        self.op.read(path).await.map_err(opendal_to_vfs)
     }
 
     pub fn read_dirty(&self, fh: u64, offset: u64, size: u32) -> Option<Bytes> {
@@ -170,9 +175,10 @@ impl FlatVfs {
                 Some(f) => f,
                 None => return Err(VfsError::BadFd),
             };
-            if let Some(existing_data) = existing {
-                file.buffer = existing_data;
-            }
+            if file.buffer.is_empty() && !file.dirty
+                && let Some(existing_data) = existing {
+                    file.buffer = existing_data;
+                }
         }
 
         let mut files = self.open_files.write();
@@ -186,6 +192,7 @@ impl FlatVfs {
         }
         file.buffer[offset as usize..end].copy_from_slice(data);
         file.dirty = true;
+        file.flush_generation += 1;
         Ok(data.len() as u32)
     }
 
@@ -194,12 +201,12 @@ impl FlatVfs {
             self.op
                 .write(path, Vec::<u8>::new())
                 .await
-                .map_err(|_| VfsError::Io)?;
+                .map_err(opendal_to_vfs)?;
         } else {
             let data = self.read(path).await?;
             let mut bytes = data.to_vec();
             bytes.resize(new_size as usize, 0);
-            self.op.write(path, bytes).await.map_err(|_| VfsError::Io)?;
+            self.op.write(path, bytes).await.map_err(opendal_to_vfs)?;
         }
 
         let mut files = self.open_files.write();
@@ -220,28 +227,39 @@ impl FlatVfs {
                 path,
                 buffer: Vec::new(),
                 dirty: false,
+                flush_generation: 0,
             },
         );
         fh
     }
 
+    pub async fn create_empty(&self, path: &str) -> Result<(), VfsError> {
+        self.op
+            .write(path, Vec::<u8>::new())
+            .await
+            .map_err(opendal_to_vfs)
+    }
+
     pub async fn flush(&self, fh: u64) -> Result<(), VfsError> {
-        let (path, data) = {
+        let (path, data, flush_gen) = {
             let files = self.open_files.read();
             match files.get(&fh) {
-                Some(f) if f.dirty => (f.path.clone(), Bytes::from(f.buffer.clone())),
+                Some(f) if f.dirty => {
+                    (f.path.clone(), Bytes::from(f.buffer.clone()), f.flush_generation)
+                }
                 Some(_) => return Ok(()),
                 None => return Err(VfsError::BadFd),
             }
         };
 
-        self.op.write(&path, data).await.map_err(|_| VfsError::Io)?;
+        self.op.write(&path, data).await.map_err(opendal_to_vfs)?;
 
         {
             let mut files = self.open_files.write();
-            if let Some(f) = files.get_mut(&fh) {
-                f.dirty = false;
-            }
+            if let Some(f) = files.get_mut(&fh)
+                && f.flush_generation == flush_gen {
+                    f.dirty = false;
+                }
         }
 
         Ok(())
@@ -255,19 +273,19 @@ impl FlatVfs {
     }
 
     pub async fn delete(&self, path: &str) -> Result<(), VfsError> {
-        self.op.delete(path).await.map_err(|_| VfsError::Io)
+        self.op.delete(path).await.map_err(opendal_to_vfs)
     }
 
     pub async fn create_dir(&self, path: &str) -> Result<(), VfsError> {
-        self.op.create_dir(path).await.map_err(|_| VfsError::Io)
+        self.op.create_dir(path).await.map_err(opendal_to_vfs)
     }
 
     pub async fn list(&self, path: &str) -> Result<Vec<(String, bool)>, VfsError> {
-        self.op.list(path).await.map_err(|_| VfsError::Io)
+        self.op.list(path).await.map_err(opendal_to_vfs)
     }
 
     pub async fn rename(&self, src: &str, dst: &str) -> Result<(), VfsError> {
-        self.op.copy(src, dst).await.map_err(|_| VfsError::Io)?;
-        self.op.delete(src).await.map_err(|_| VfsError::Io)
+        self.op.copy(src, dst).await.map_err(opendal_to_vfs)?;
+        self.op.delete(src).await.map_err(opendal_to_vfs)
     }
 }
