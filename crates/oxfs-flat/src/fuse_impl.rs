@@ -44,6 +44,7 @@ pub struct FlatFuse {
     next_fh: AtomicU64,
     uid: u32,
     gid: u32,
+    writeback: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +78,7 @@ impl FlatFuse {
             next_fh: AtomicU64::new(1),
             uid,
             gid,
+            writeback: config.writeback,
         }
     }
 
@@ -635,6 +637,10 @@ impl Filesystem for FlatFuse {
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
+        if self.writeback {
+            reply.ok();
+            return;
+        }
         let fh_val: u64 = fh.into();
         match self.rt.block_on(self.flush_file(fh_val)) {
             Ok(()) => reply.ok(),
