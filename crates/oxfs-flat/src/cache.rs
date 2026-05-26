@@ -11,10 +11,9 @@ struct CachedContent {
 
 /// Caching wrapper around an OpenDAL operator.
 ///
-/// Provides ETag-validated content caching (write-through mode),
-/// TTL-based stat and directory caches, and automatic invalidation
-/// on writes. No filesystem semantics: callers handle path
-/// resolution, dirty buffers, and flush policy.
+/// Owns all cache invariants: every mutation automatically invalidates
+/// the affected stat/content/dir caches, including the parent directory
+/// listing. Callers never need to do manual cache maintenance.
 pub struct CachedOperator {
     op: Operator,
     dir_cache: moka::future::Cache<String, Vec<(String, bool)>>,
@@ -117,25 +116,26 @@ impl CachedOperator {
         data: impl Into<opendal::Buffer>,
     ) -> Result<(), opendal::Error> {
         self.op.write(path, data).await?;
-        self.invalidate(path).await;
+        self.invalidate_path(path).await;
         Ok(())
     }
 
     pub async fn delete(&self, path: &str) -> Result<(), opendal::Error> {
         self.op.delete(path).await?;
-        self.invalidate(path).await;
+        self.invalidate_path(path).await;
         Ok(())
     }
 
     pub async fn copy(&self, from: &str, to: &str) -> Result<(), opendal::Error> {
         self.op.copy(from, to).await?;
-        self.invalidate(from).await;
-        self.invalidate(to).await;
+        self.invalidate_path(to).await;
         Ok(())
     }
 
     pub async fn create_dir(&self, path: &str) -> Result<(), opendal::Error> {
-        self.op.create_dir(path).await
+        self.op.create_dir(path).await?;
+        self.invalidate_path(path).await;
+        Ok(())
     }
 
     pub async fn list(&self, path: &str) -> Result<Vec<(String, bool)>, opendal::Error> {
@@ -172,12 +172,30 @@ impl CachedOperator {
         Ok(entries)
     }
 
-    pub async fn invalidate(&self, path: &str) {
-        self.stat_cache.remove(path).await;
-        self.content_cache.remove(path).await;
+    /// Invalidate all caches affected by a mutation at `path`:
+    /// stat and content for the path itself (both with and without
+    /// trailing slash), and the parent directory listing.
+    async fn invalidate_path(&self, path: &str) {
+        let normalized = path.trim_end_matches('/');
+        let with_slash = format!("{}/", normalized);
+
+        self.stat_cache.remove(normalized).await;
+        self.stat_cache.remove(&with_slash).await;
+        self.content_cache.remove(normalized).await;
+        self.content_cache.remove(&with_slash).await;
+
+        if let Some(parent) = Self::parent(normalized) {
+            self.dir_cache.remove(parent).await;
+        }
     }
 
-    pub async fn invalidate_dir(&self, path: &str) {
-        self.dir_cache.remove(path).await;
+    fn parent(path: &str) -> Option<&str> {
+        if path.is_empty() {
+            return None;
+        }
+        match path.rfind('/') {
+            Some(pos) => Some(&path[..pos]),
+            None => Some(""),
+        }
     }
 }

@@ -117,11 +117,14 @@ impl FlatVfs {
 
     pub fn dirty_stat(&self, path: &str) -> Option<FileStat> {
         let files = self.open_files.read();
-        files.values().find(|f| f.path == path && f.dirty).map(|f| FileStat {
-            size: f.buffer.len() as u64,
-            is_dir: false,
-            last_modified: SystemTime::now(),
-        })
+        files
+            .values()
+            .find(|f| f.path == path && f.dirty)
+            .map(|f| FileStat {
+                size: f.buffer.len() as u64,
+                is_dir: false,
+                last_modified: SystemTime::now(),
+            })
     }
 
     pub async fn read(&self, path: &str) -> Result<Bytes, VfsError> {
@@ -145,30 +148,38 @@ impl FlatVfs {
     }
 
     pub async fn write_at(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, VfsError> {
+        let needs_read = {
+            let files = self.open_files.read();
+            match files.get(&fh) {
+                Some(f) => f.buffer.is_empty() && !f.dirty,
+                None => return Err(VfsError::BadFd),
+            }
+        };
+
+        if needs_read {
+            let path = {
+                let files = self.open_files.read();
+                match files.get(&fh) {
+                    Some(f) => f.path.clone(),
+                    None => return Err(VfsError::BadFd),
+                }
+            };
+            let existing = self.op.read(&path).await.ok().map(|d| d.to_vec());
+            let mut files = self.open_files.write();
+            let file = match files.get_mut(&fh) {
+                Some(f) => f,
+                None => return Err(VfsError::BadFd),
+            };
+            if let Some(existing_data) = existing {
+                file.buffer = existing_data;
+            }
+        }
+
         let mut files = self.open_files.write();
         let file = match files.get_mut(&fh) {
             Some(f) => f,
             None => return Err(VfsError::BadFd),
         };
-
-        if file.buffer.is_empty() && !file.dirty {
-            let path = file.path.clone();
-            drop(files);
-            let existing = self.op.read(&path).await.ok().map(|d| d.to_vec());
-            let mut files = self.open_files.write();
-            let file = files.get_mut(&fh).unwrap();
-            if let Some(existing_data) = existing {
-                file.buffer = existing_data;
-            }
-            let end = offset as usize + data.len();
-            if end > file.buffer.len() {
-                file.buffer.resize(end, 0);
-            }
-            file.buffer[offset as usize..end].copy_from_slice(data);
-            file.dirty = true;
-            return Ok(data.len() as u32);
-        }
-
         let end = offset as usize + data.len();
         if end > file.buffer.len() {
             file.buffer.resize(end, 0);
@@ -190,6 +201,14 @@ impl FlatVfs {
             bytes.resize(new_size as usize, 0);
             self.op.write(path, bytes).await.map_err(|_| VfsError::Io)?;
         }
+
+        let mut files = self.open_files.write();
+        for f in files.values_mut() {
+            if f.path == path && f.dirty {
+                f.buffer.resize(new_size as usize, 0);
+            }
+        }
+
         Ok(())
     }
 
@@ -250,9 +269,5 @@ impl FlatVfs {
     pub async fn rename(&self, src: &str, dst: &str) -> Result<(), VfsError> {
         self.op.copy(src, dst).await.map_err(|_| VfsError::Io)?;
         self.op.delete(src).await.map_err(|_| VfsError::Io)
-    }
-
-    pub async fn invalidate_dir(&self, path: &str) {
-        self.op.invalidate_dir(path).await;
     }
 }

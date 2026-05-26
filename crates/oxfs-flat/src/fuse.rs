@@ -6,7 +6,6 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 
-use crate::cache::CachedOperator;
 use crate::inode::InodeTable;
 use crate::vfs::{FileStat, FlatVfs, VfsError};
 use crate::FlatConfig;
@@ -34,7 +33,7 @@ impl FlatFuse {
     ) -> Self {
         let uid = unsafe { getuid() };
         let gid = unsafe { getgid() };
-        let op = CachedOperator::new(operator, config.dir_ttl, config.writeback);
+        let op = crate::cache::CachedOperator::new(operator, config.dir_ttl, config.writeback);
 
         Self {
             vfs: FlatVfs::new(op, config.writeback),
@@ -149,11 +148,11 @@ impl Filesystem for FlatFuse {
             None => { reply.error(Errno::ENOENT); return; }
         };
 
-        if let Some(new_size) = size {
-            if let Err(e) = self.rt.block_on(self.vfs.truncate(&path, new_size)) {
-                reply.error(to_errno(e));
-                return;
-            }
+        if let Some(new_size) = size
+            && let Err(e) = self.rt.block_on(self.vfs.truncate(&path, new_size))
+        {
+            reply.error(to_errno(e));
+            return;
         }
 
         match self.rt.block_on(self.vfs.stat(&path)) {
@@ -302,7 +301,6 @@ impl Filesystem for FlatFuse {
         let path = Self::join_path(&parent_path, name);
         let ino = self.inodes.allocate(&path);
         let fh = self.vfs.open(path);
-        self.rt.block_on(self.vfs.invalidate_dir(&parent_path));
 
         let stat = FileStat { size: 0, is_dir: false, last_modified: SystemTime::now() };
         reply.created(&TTL, &self.make_attr(ino, &stat), fuser::Generation(0), fuser::FileHandle(fh), fuser::FopenFlags::empty());
@@ -319,11 +317,7 @@ impl Filesystem for FlatFuse {
         };
         let path = Self::join_path(&parent_path, name);
 
-        match self.rt.block_on(async {
-            self.vfs.delete(&path).await?;
-            self.vfs.invalidate_dir(&parent_path).await;
-            Ok::<(), VfsError>(())
-        }) {
+        match self.rt.block_on(self.vfs.delete(&path)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(to_errno(e)),
         }
@@ -344,11 +338,7 @@ impl Filesystem for FlatFuse {
         let path = Self::join_path(&parent_path, name);
         let dir_path = format!("{}/", path);
 
-        match self.rt.block_on(async {
-            self.vfs.create_dir(&dir_path).await?;
-            self.vfs.invalidate_dir(&parent_path).await;
-            Ok::<(), VfsError>(())
-        }) {
+        match self.rt.block_on(self.vfs.create_dir(&dir_path)) {
             Ok(()) => {
                 let ino = self.inodes.allocate(&path);
                 let stat = FileStat { size: 0, is_dir: true, last_modified: SystemTime::now() };
@@ -370,11 +360,7 @@ impl Filesystem for FlatFuse {
         let path = Self::join_path(&parent_path, name);
         let dir_path = format!("{}/", path);
 
-        match self.rt.block_on(async {
-            self.vfs.delete(&dir_path).await?;
-            self.vfs.invalidate_dir(&parent_path).await;
-            Ok::<(), VfsError>(())
-        }) {
+        match self.rt.block_on(self.vfs.delete(&dir_path)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(to_errno(e)),
         }
@@ -404,12 +390,7 @@ impl Filesystem for FlatFuse {
         let src = Self::join_path(&src_parent, src_name);
         let dst = Self::join_path(&dst_parent, dst_name);
 
-        match self.rt.block_on(async {
-            self.vfs.rename(&src, &dst).await?;
-            self.vfs.invalidate_dir(&src_parent).await;
-            self.vfs.invalidate_dir(&dst_parent).await;
-            Ok::<(), VfsError>(())
-        }) {
+        match self.rt.block_on(self.vfs.rename(&src, &dst)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(to_errno(e)),
         }
