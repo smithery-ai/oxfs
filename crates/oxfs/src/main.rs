@@ -55,7 +55,7 @@ enum Command {
         daemonize: bool,
         /// Filesystem mode: "posix" (default) uses meta engine + cache layers;
         /// "flat" maps S3 keys directly to file paths with no local metadata.
-        #[arg(long, default_value = "posix")]
+        #[arg(long, default_value = "flat")]
         mode: String,
     },
 }
