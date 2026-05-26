@@ -11,6 +11,12 @@ pub struct InodeTable {
     next_ino: AtomicU64,
 }
 
+impl Default for InodeTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InodeTable {
     pub fn new() -> Self {
         let mut p2i = HashMap::new();
