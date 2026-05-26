@@ -95,7 +95,7 @@ impl FlatFuse {
         FileAttr {
             ino: fuser::INodeNo(ino),
             size: stat.size,
-            blocks: (stat.size + 511) / 512,
+            blocks: stat.size.div_ceil(512),
             atime: stat.last_modified,
             mtime: stat.last_modified,
             ctime: stat.last_modified,
@@ -501,17 +501,15 @@ impl Filesystem for FlatFuse {
         // Check if we have a dirty buffer
         {
             let files = self.open_files.read();
-            if let Some(f) = files.get(&fh_val) {
-                if f.dirty {
-                    let start = offset as usize;
-                    let end = std::cmp::min(start + size as usize, f.buffer.len());
-                    if start >= f.buffer.len() {
-                        reply.data(&[]);
-                    } else {
-                        reply.data(&f.buffer[start..end]);
-                    }
-                    return;
+            if let Some(f) = files.get(&fh_val).filter(|f| f.dirty) {
+                let start = offset as usize;
+                let end = std::cmp::min(start + size as usize, f.buffer.len());
+                if start >= f.buffer.len() {
+                    reply.data(&[]);
+                } else {
+                    reply.data(&f.buffer[start..end]);
                 }
+                return;
             }
         }
 
